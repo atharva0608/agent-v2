@@ -1,5 +1,5 @@
 """
-AWS Spot Optimizer - Agent Backend v3.0.0 (PRODUCTION READY)
+AWS Spot Optimizer - Agent Backend v3.1.0 (PRODUCTION READY)
 ===========================================================================
 FIXES ALL AGENT-SIDE ISSUES + FULL COMPATIBILITY WITH SERVER v2.3.0
 
@@ -12,6 +12,7 @@ Agent-Side Fixes Implemented:
 ✓ #9: Proper auto-terminate with confirmation
 ✓ #10: Working disable toggle with immediate effect
 ✓ #11: Fast switch action updates (15s check interval)
+✓ FIX: Price data fetching with VPC support and robust fallbacks
 
 Key Features:
 - Dual mode verification (AWS API + Instance Metadata)
@@ -20,6 +21,7 @@ Key Features:
 - Comprehensive error handling
 - Detailed switch timing tracking
 - Memory-efficient operation
+- Robust price data collection with VPC product description support
 ===========================================================================
 """
 
@@ -89,7 +91,7 @@ class AgentConfig:
     CREATE_SNAPSHOT_ON_SWITCH: bool = os.getenv('CREATE_SNAPSHOT_ON_SWITCH', 'true').lower() == 'true'
     
     # Agent Version
-    AGENT_VERSION: str = '3.0.0'
+    AGENT_VERSION: str = '3.1.0'
     
     def validate(self) -> bool:
         """Validate required configuration"""
@@ -385,56 +387,106 @@ class SpotPricingCollector:
     def _get_spot_price(self, instance_type: str, az: str) -> Optional[float]:
         """Get current spot price for instance type in AZ"""
         try:
+            # Try multiple product descriptions to ensure we get results
+            # Most modern instances use VPC, so try that first
+            product_descriptions = [
+                'Linux/UNIX (Amazon VPC)',
+                'Linux/UNIX'
+            ]
+
+            for product_desc in product_descriptions:
+                try:
+                    response = self.ec2.describe_spot_price_history(
+                        InstanceTypes=[instance_type],
+                        AvailabilityZone=az,
+                        MaxResults=1,
+                        ProductDescriptions=[product_desc]
+                    )
+
+                    if response['SpotPriceHistory']:
+                        price = float(response['SpotPriceHistory'][0]['SpotPrice'])
+                        logger.debug(f"Got spot price for {instance_type} in {az}: ${price} ({product_desc})")
+                        return price
+                except Exception as e:
+                    logger.debug(f"Failed with {product_desc}: {e}")
+                    continue
+
+            # If no product description worked, try without the filter
             response = self.ec2.describe_spot_price_history(
                 InstanceTypes=[instance_type],
                 AvailabilityZone=az,
-                MaxResults=1,
-                ProductDescriptions=['Linux/UNIX']
+                MaxResults=1
             )
-            
+
             if response['SpotPriceHistory']:
-                return float(response['SpotPriceHistory'][0]['SpotPrice'])
-            
+                price = float(response['SpotPriceHistory'][0]['SpotPrice'])
+                product_desc = response['SpotPriceHistory'][0].get('ProductDescription', 'Unknown')
+                logger.debug(f"Got spot price for {instance_type} in {az}: ${price} ({product_desc})")
+                return price
+
+            logger.warning(f"No spot price history found for {instance_type} in {az}")
             return None
         except Exception as e:
-            logger.debug(f"Failed to get spot price for {instance_type} in {az}: {e}")
+            logger.error(f"Failed to get spot price for {instance_type} in {az}: {e}")
             return None
     
     def get_ondemand_price(self, instance_type: str, region: str) -> float:
         """Get on-demand price (from pricing API or fallback)"""
         try:
             # Try to get from pricing API
+            # NOTE: Pricing API is only available in us-east-1
             pricing = boto3.client('pricing', region_name='us-east-1')
-            
+
+            location = self._region_to_location(region)
+            logger.debug(f"Fetching on-demand price for {instance_type} in {location}")
+
             response = pricing.get_products(
                 ServiceCode='AmazonEC2',
                 Filters=[
                     {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
-                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': self._region_to_location(region)},
+                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': location},
                     {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'},
                     {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
-                    {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'}
+                    {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
+                    {'Type': 'TERM_MATCH', 'Field': 'capacitystatus', 'Value': 'Used'}
                 ],
                 MaxResults=1
             )
-            
+
             if response['PriceList']:
                 price_data = json.loads(response['PriceList'][0])
                 terms = price_data['terms']['OnDemand']
-                
+
                 for term in terms.values():
                     for price_dim in term['priceDimensions'].values():
-                        return float(price_dim['pricePerUnit']['USD'])
-            
+                        price = float(price_dim['pricePerUnit']['USD'])
+                        logger.debug(f"Got on-demand price for {instance_type}: ${price}/hr")
+                        return price
+
+            logger.warning(f"No on-demand price found in pricing API for {instance_type} in {location}")
+
             # Fallback: estimate based on spot price
             spot_pools = self.get_spot_pools(instance_type, region)
             if spot_pools:
                 avg_spot = sum(p['price'] for p in spot_pools) / len(spot_pools)
-                return avg_spot * 3.0  # Rough estimate
-            
+                estimated_price = avg_spot * 3.0  # Rough estimate: spot is typically 60-70% cheaper
+                logger.info(f"Estimated on-demand price for {instance_type}: ${estimated_price}/hr (based on spot prices)")
+                return estimated_price
+
+            logger.error(f"Could not determine on-demand price for {instance_type}, using fallback")
             return 0.1  # Default fallback
         except Exception as e:
-            logger.warning(f"Failed to get on-demand price: {e}")
+            logger.error(f"Failed to get on-demand price for {instance_type}: {e}")
+            # Try to estimate from spot
+            try:
+                spot_pools = self.get_spot_pools(instance_type, region)
+                if spot_pools:
+                    avg_spot = sum(p['price'] for p in spot_pools) / len(spot_pools)
+                    estimated_price = avg_spot * 3.0
+                    logger.info(f"Using estimated on-demand price: ${estimated_price}/hr")
+                    return estimated_price
+            except:
+                pass
             return 0.1
     
     def _region_to_location(self, region: str) -> str:
@@ -532,24 +584,38 @@ class InstanceSwitcher:
                 else:
                     logger.warning(f"Failed to terminate old instance {current_instance_id}")
             
-            # Collect pricing data
+            # Collect pricing data for switch report
+            logger.info("Collecting pricing data for switch report...")
             pricing_collector = SpotPricingCollector()
-            
-            old_price_data = {
-                'on_demand': pricing_collector.get_ondemand_price(
-                    current_instance['instance_type'], config.REGION
-                )
-            }
-            
+
+            # Get on-demand price
+            on_demand_price = pricing_collector.get_ondemand_price(
+                current_instance['instance_type'], config.REGION
+            )
+            logger.info(f"On-demand price: ${on_demand_price}/hr")
+
+            old_price_data = {'on_demand': on_demand_price}
+
+            # Get old instance spot price if applicable
             if current_instance.get('current_mode') == 'spot':
-                old_price_data['old_spot'] = self._get_current_spot_price(
+                old_spot_price = self._get_current_spot_price(
                     current_instance['instance_type'], current_instance['az']
                 )
-            
+                old_price_data['old_spot'] = old_spot_price
+                logger.info(f"Old spot price ({current_instance['az']}): ${old_spot_price}/hr")
+
+            # Get new instance spot price if switching to spot
             if target_mode == 'spot':
-                old_price_data['new_spot'] = self._get_current_spot_price(
+                new_spot_price = self._get_current_spot_price(
                     new_instance['instance_type'], new_instance['az']
                 )
+                old_price_data['new_spot'] = new_spot_price
+                logger.info(f"New spot price ({new_instance['az']}): ${new_spot_price}/hr")
+
+                # Calculate savings
+                if new_spot_price > 0 and on_demand_price > 0:
+                    savings_pct = ((on_demand_price - new_spot_price) / on_demand_price) * 100
+                    logger.info(f"💰 Estimated savings: {savings_pct:.1f}% (${on_demand_price - new_spot_price:.4f}/hr)")
             
             # Send switch report to server
             switch_report = {
@@ -726,9 +792,17 @@ class InstanceSwitcher:
             logger.error(f"Failed to cleanup instance: {e}")
     
     def _get_current_spot_price(self, instance_type: str, az: str) -> float:
-        """Get current spot price"""
-        collector = SpotPricingCollector()
-        return collector._get_spot_price(instance_type, az) or 0.0
+        """Get current spot price for switch report"""
+        try:
+            collector = SpotPricingCollector()
+            price = collector._get_spot_price(instance_type, az)
+            if price is None:
+                logger.warning(f"Could not fetch spot price for {instance_type} in {az}, using 0.0")
+                return 0.0
+            return price
+        except Exception as e:
+            logger.error(f"Error fetching spot price for {instance_type} in {az}: {e}")
+            return 0.0
 
 # ============================================================================
 # MAIN AGENT CLASS
@@ -995,20 +1069,34 @@ class SpotOptimizerAgent:
         Runs every 5 minutes
         """
         logger.info("Pricing report worker started")
-        
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 # Get current instance details
                 instance_type = InstanceMetadata.get_instance_type()
                 az = InstanceMetadata.get_availability_zone()
-                
+
+                logger.info(f"Collecting pricing data for {instance_type} in {az}...")
+
                 # FIX #3: Dual mode verification
                 current_mode, api_mode = InstanceMetadata.detect_instance_mode_dual()
-                
+
                 # Get pricing data
+                logger.debug("Fetching spot pools...")
                 spot_pools = self.pricing_collector.get_spot_pools(instance_type, config.REGION)
+                logger.info(f"Found {len(spot_pools)} spot pools with pricing data")
+
+                logger.debug("Fetching on-demand price...")
                 on_demand_price = self.pricing_collector.get_ondemand_price(instance_type, config.REGION)
-                
+                logger.info(f"On-demand price: ${on_demand_price}/hr")
+
+                # Log spot pool prices for debugging
+                if spot_pools:
+                    for pool in spot_pools:
+                        logger.debug(f"  Pool {pool['pool_id']}: ${pool['price']}/hr")
+                else:
+                    logger.warning("No spot pools found! Price data may not be available.")
+
                 # Build report
                 report = {
                     'instance': {
@@ -1024,18 +1112,19 @@ class SpotOptimizerAgent:
                     },
                     'spot_pools': spot_pools
                 }
-                
+
                 # Send report
+                logger.debug(f"Sending pricing report to server...")
                 success = self.server_api.send_pricing_report(self.agent_id, report)
-                
+
                 if success:
-                    logger.debug(f"Pricing report sent: mode={current_mode}, pools={len(spot_pools)}")
+                    logger.info(f"✓ Pricing report sent successfully: mode={current_mode}, {len(spot_pools)} pools, on-demand=${on_demand_price}/hr")
                 else:
-                    logger.warning("Pricing report failed")
-                
+                    logger.error("✗ Failed to send pricing report to server")
+
             except Exception as e:
                 logger.error(f"Pricing report error: {e}", exc_info=True)
-            
+
             # Wait for next interval
             self.shutdown_event.wait(config.PRICING_REPORT_INTERVAL)
     
@@ -1071,7 +1160,7 @@ class SpotOptimizerAgent:
 def main():
     """Main entry point"""
     logger.info("="*80)
-    logger.info("AWS Spot Optimizer Agent v3.0.0")
+    logger.info("AWS Spot Optimizer Agent v3.1.0")
     logger.info("="*80)
     
     # Validate configuration
