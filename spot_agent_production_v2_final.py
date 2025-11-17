@@ -584,24 +584,38 @@ class InstanceSwitcher:
                 else:
                     logger.warning(f"Failed to terminate old instance {current_instance_id}")
             
-            # Collect pricing data
+            # Collect pricing data for switch report
+            logger.info("Collecting pricing data for switch report...")
             pricing_collector = SpotPricingCollector()
-            
-            old_price_data = {
-                'on_demand': pricing_collector.get_ondemand_price(
-                    current_instance['instance_type'], config.REGION
-                )
-            }
-            
+
+            # Get on-demand price
+            on_demand_price = pricing_collector.get_ondemand_price(
+                current_instance['instance_type'], config.REGION
+            )
+            logger.info(f"On-demand price: ${on_demand_price}/hr")
+
+            old_price_data = {'on_demand': on_demand_price}
+
+            # Get old instance spot price if applicable
             if current_instance.get('current_mode') == 'spot':
-                old_price_data['old_spot'] = self._get_current_spot_price(
+                old_spot_price = self._get_current_spot_price(
                     current_instance['instance_type'], current_instance['az']
                 )
-            
+                old_price_data['old_spot'] = old_spot_price
+                logger.info(f"Old spot price ({current_instance['az']}): ${old_spot_price}/hr")
+
+            # Get new instance spot price if switching to spot
             if target_mode == 'spot':
-                old_price_data['new_spot'] = self._get_current_spot_price(
+                new_spot_price = self._get_current_spot_price(
                     new_instance['instance_type'], new_instance['az']
                 )
+                old_price_data['new_spot'] = new_spot_price
+                logger.info(f"New spot price ({new_instance['az']}): ${new_spot_price}/hr")
+
+                # Calculate savings
+                if new_spot_price > 0 and on_demand_price > 0:
+                    savings_pct = ((on_demand_price - new_spot_price) / on_demand_price) * 100
+                    logger.info(f"💰 Estimated savings: {savings_pct:.1f}% (${on_demand_price - new_spot_price:.4f}/hr)")
             
             # Send switch report to server
             switch_report = {
@@ -778,9 +792,17 @@ class InstanceSwitcher:
             logger.error(f"Failed to cleanup instance: {e}")
     
     def _get_current_spot_price(self, instance_type: str, az: str) -> float:
-        """Get current spot price"""
-        collector = SpotPricingCollector()
-        return collector._get_spot_price(instance_type, az) or 0.0
+        """Get current spot price for switch report"""
+        try:
+            collector = SpotPricingCollector()
+            price = collector._get_spot_price(instance_type, az)
+            if price is None:
+                logger.warning(f"Could not fetch spot price for {instance_type} in {az}, using 0.0")
+                return 0.0
+            return price
+        except Exception as e:
+            logger.error(f"Error fetching spot price for {instance_type} in {az}: {e}")
+            return 0.0
 
 # ============================================================================
 # MAIN AGENT CLASS
