@@ -126,6 +126,38 @@ if [ "$INSTALL_AGENT" = true ]; then
         exit 1
     fi
 
+    # Validate token with backend
+    print_info "Validating client token with server..."
+
+    # Make request and capture response
+    VALIDATION_RESPONSE=$(curl -s -w "HTTP_CODE:%{http_code}" \
+        -H "Authorization: Bearer $CLIENT_TOKEN" \
+        "${SERVER_URL}/api/client/validate" 2>/dev/null)
+
+    # Extract HTTP code from the end
+    HTTP_CODE=$(echo "$VALIDATION_RESPONSE" | grep -oP 'HTTP_CODE:\K[0-9]+' || echo "000")
+    RESPONSE_BODY=$(echo "$VALIDATION_RESPONSE" | sed 's/HTTP_CODE:[0-9]*$//')
+
+    if [ "$HTTP_CODE" = "200" ]; then
+        # Try to extract client name (works with or without jq)
+        if command -v jq &> /dev/null; then
+            CLIENT_NAME=$(echo "$RESPONSE_BODY" | jq -r '.name // "Unknown"' 2>/dev/null)
+        else
+            CLIENT_NAME=$(echo "$RESPONSE_BODY" | grep -oP '"name"\s*:\s*"\K[^"]+' || echo "Validated")
+        fi
+        print_success "Token validated successfully! Client: $CLIENT_NAME"
+    elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+        print_error "Invalid client token! Please check your token and try again."
+        print_error "Get your token from the admin dashboard at: $SERVER_URL"
+        exit 1
+    elif [ "$HTTP_CODE" = "000" ] || [ -z "$HTTP_CODE" ]; then
+        print_error "Cannot connect to server at: $SERVER_URL"
+        print_error "Please check the server URL and ensure the server is running."
+        exit 1
+    else
+        print_warning "Could not validate token (HTTP $HTTP_CODE). Proceeding anyway..."
+    fi
+
     read -p "Enter AWS Region [ap-south-1]: " AWS_REGION
     AWS_REGION=${AWS_REGION:-ap-south-1}
 
@@ -134,8 +166,10 @@ fi
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
     echo ""
-    read -p "Enter Backend API URL (e.g., http://10.0.1.50:5000): " BACKEND_URL
-    BACKEND_URL=${BACKEND_URL:-http://localhost:5000}
+    # Default to SERVER_URL if agent is also being installed
+    DEFAULT_BACKEND=${SERVER_URL:-http://localhost:5000}
+    read -p "Enter Backend API URL [$DEFAULT_BACKEND]: " BACKEND_URL
+    BACKEND_URL=${BACKEND_URL:-$DEFAULT_BACKEND}
     BACKEND_URL=${BACKEND_URL%/}
 fi
 
@@ -144,9 +178,10 @@ print_warning "Installation Summary:"
 [ "$INSTALL_AGENT" = true ] && echo "  • Agent: YES (Server: $SERVER_URL)"
 [ "$INSTALL_DASHBOARD" = true ] && echo "  • Dashboard: YES (Backend: $BACKEND_URL)"
 echo ""
-read -p "Continue with installation? (yes/no): " CONFIRM
+read -p "Continue with installation? (y/yes): " CONFIRM
 
-if [[ ! $CONFIRM =~ ^[Yy][Ee][Ss]$ ]]; then
+# Accept y, Y, yes, Yes, YES
+if [[ ! "$CONFIRM" =~ ^[Yy]([Ee][Ss])?$ ]]; then
     print_error "Installation cancelled."
     exit 0
 fi
