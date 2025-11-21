@@ -1130,7 +1130,12 @@ class SpotOptimizerAgent:
             private_ip = InstanceMetadata.get_private_ip()
             public_ip = InstanceMetadata.get_public_ip()
 
+            # Detect mode - use metadata as fallback if API fails
             current_mode, api_mode = InstanceMetadata.detect_instance_mode_dual()
+            # If both fail, default to ondemand
+            if current_mode == 'unknown':
+                current_mode = 'ondemand'
+                logger.warning("Could not detect instance mode, defaulting to 'ondemand'")
 
             registration_data = {
                 'client_token': config.CLIENT_TOKEN,
@@ -1142,7 +1147,7 @@ class SpotOptimizerAgent:
                 'ami_id': ami_id,
                 'agent_version': config.AGENT_VERSION,
                 'logical_agent_id': self.logical_agent_id,
-                'current_mode': current_mode,
+                'mode': current_mode,  # Backend expects 'mode', not 'current_mode'
                 'private_ip': private_ip,
                 'public_ip': public_ip
             }
