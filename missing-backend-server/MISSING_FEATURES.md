@@ -367,3 +367,49 @@ When enabling `manual_replica_enabled`:
 When enabling `auto_switch_enabled`:
 - Must disable `manual_replica_enabled`
 - Must terminate any existing manual replicas
+
+---
+
+## Known Issues & Fixes
+
+### MySQL Collation Error in `/api/agents/{id}/pending-commands`
+
+**Error:**
+```
+HTTP 500: {"error":"1271 (HY000): Illegal mix of collations for operation 'UNION'"}
+```
+
+**Cause:** Different tables or columns have mismatched character collations when using UNION queries.
+
+**Fix:** Run this SQL on your central server database to standardize collations:
+
+```sql
+-- Check current collations
+SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'your_database_name'
+AND COLLATION_NAME IS NOT NULL
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+-- Fix collation for commands table (adjust table/column names as needed)
+ALTER TABLE commands CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+ALTER TABLE switch_operations CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+ALTER TABLE agents CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Or fix the entire database
+ALTER DATABASE your_database_name CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- After changing database default, convert all tables:
+-- Run this for each table that's part of the UNION query
+ALTER TABLE table_name CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+**Alternative Fix (in Python backend):** Add explicit collation in UNION queries:
+```python
+# In your pending-commands endpoint SQL query, add COLLATE clause:
+query = """
+    SELECT id, command_type, ... FROM commands WHERE agent_id = %s
+    UNION ALL
+    SELECT id COLLATE utf8mb4_unicode_ci, ... FROM switch_operations WHERE ...
+"""
+```
