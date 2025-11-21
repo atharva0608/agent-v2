@@ -600,9 +600,9 @@ if [ "$INSTALL_DASHBOARD" = true ]; then
 fi
 
 print_info "Helper Commands:"
-echo "  • ${BLUE}spot-optimizer-status${NC}  - Check all services"
-echo "  • ${BLUE}spot-optimizer-restart${NC} - Restart all services"
-echo "  • ${BLUE}spot-optimizer-logs${NC}    - View live logs"
+echo -e "  • ${BLUE}spot-optimizer-status${NC}  - Check all services"
+echo -e "  • ${BLUE}spot-optimizer-restart${NC} - Restart all services"
+echo -e "  • ${BLUE}spot-optimizer-logs${NC}    - View live logs"
 echo ""
 
 echo -e "${GREEN}════════════════════════════════════════════════════════════════════════════════${NC}"
