@@ -372,9 +372,12 @@ class ServerAPI:
         """Report termination notice and get emergency instructions"""
         return self._make_request('POST', f'/api/agents/{agent_id}/termination-imminent', json=termination_data)
 
-    def report_rebalance_recommendation(self, agent_id: str) -> Optional[Dict]:
+    def report_rebalance_recommendation(self, agent_id: str, instance_id: str) -> Optional[Dict]:
         """Report rebalance recommendation"""
-        return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={})
+        return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={
+            'instance_id': instance_id,
+            'detected_at': datetime.utcnow().isoformat()
+        })
 
     def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
         """Create emergency replica"""
@@ -1187,11 +1190,26 @@ class SpotOptimizerAgent:
             logger.info(f"Started worker: {worker_name}")
 
     def _heartbeat_worker(self):
-        """Send accurate heartbeat"""
+        """Send accurate heartbeat with instance details"""
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 status = 'online' if self.is_enabled else 'disabled'
-                self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id])
+
+                # Get current instance details for heartbeat
+                instance_type = InstanceMetadata.get_metadata('meta-data/instance-type')
+                az = InstanceMetadata.get_metadata('meta-data/placement/availability-zone')
+                current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
+                if current_mode == 'unknown':
+                    current_mode = 'ondemand'
+
+                extra_data = {
+                    'instance_id': self.instance_id,
+                    'instance_type': instance_type,
+                    'mode': current_mode,
+                    'az': az
+                }
+
+                self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id], extra_data)
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
 
@@ -1268,11 +1286,33 @@ class SpotOptimizerAgent:
                 instance_type = InstanceMetadata.get_instance_type()
                 az = InstanceMetadata.get_availability_zone()
                 current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
+                if current_mode == 'unknown':
+                    current_mode = 'ondemand'
 
                 spot_pools = self.pricing_collector.get_spot_pools(instance_type, config.REGION)
                 on_demand_price = self.cached_ondemand_price or self.pricing_collector.get_ondemand_price(
                     instance_type, config.REGION
                 )
+
+                # Get current spot price from pools if on spot
+                current_spot_price = None
+                current_pool_id = None
+                cheapest_pool = None
+
+                if current_mode == 'spot' and spot_pools:
+                    current_pool_id = f"{instance_type}.{az}"
+                    # Find current pool price
+                    for pool in spot_pools:
+                        if pool.get('az') == az:
+                            current_spot_price = pool.get('price')
+                            break
+                    # Find cheapest pool
+                    if spot_pools:
+                        cheapest = min(spot_pools, key=lambda x: x.get('price', float('inf')))
+                        cheapest_pool = {
+                            'pool_id': cheapest.get('pool_id'),
+                            'price': cheapest.get('price')
+                        }
 
                 report = {
                     'instance': {
@@ -1280,11 +1320,16 @@ class SpotOptimizerAgent:
                         'instance_type': instance_type,
                         'region': config.REGION,
                         'az': az,
-                        'current_mode': current_mode,
-                        'current_pool_id': f"{instance_type}.{az}" if current_mode == 'spot' else None
+                        'mode': current_mode,  # Backend expects 'mode' not 'current_mode'
+                        'pool_id': current_pool_id
                     },
-                    'on_demand_price': {'price': on_demand_price},
-                    'spot_pools': spot_pools
+                    'pricing': {
+                        'on_demand_price': on_demand_price,
+                        'current_spot_price': current_spot_price,
+                        'cheapest_pool': cheapest_pool,
+                        'spot_pools': spot_pools,
+                        'collected_at': datetime.utcnow().isoformat()
+                    }
                 }
 
                 self.server_api.send_pricing_report(self.agent_id, report)
@@ -1312,8 +1357,7 @@ class SpotOptimizerAgent:
                             self.agent_id,
                             {
                                 'instance_id': self.instance_id,
-                                'action': termination_notice.get('action'),
-                                'time': termination_notice.get('time'),
+                                'termination_time': termination_notice.get('time'),  # Backend expects 'termination_time'
                                 'detected_at': datetime.utcnow().isoformat()
                             }
                         )
@@ -1341,7 +1385,7 @@ class SpotOptimizerAgent:
                     if InstanceMetadata.check_rebalance_recommendation():
                         logger.warning("REBALANCE RECOMMENDATION DETECTED!")
 
-                        response = self.server_api.report_rebalance_recommendation(self.agent_id)
+                        response = self.server_api.report_rebalance_recommendation(self.agent_id, self.instance_id)
 
                         if response and response.get('action') == 'switch':
                             logger.info("Server recommends switch based on rebalance recommendation")
