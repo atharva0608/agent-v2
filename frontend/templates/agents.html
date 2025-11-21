@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+
+{% block title %}Agents - Spot Optimizer{% endblock %}
+
+{% block content %}
+<div x-data="agentsData()" x-init="fetchAgents()">
+    <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold text-gray-800">Agents</h1>
+        <button @click="fetchAgents()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+            Refresh
+        </button>
+    </div>
+
+    <!-- Agents Table -->
+    <div class="bg-white rounded-xl shadow overflow-hidden">
+        <table class="w-full">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Agent</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Instance</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Mode</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Heartbeat</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200">
+                <template x-for="agent in agents" :key="agent.id">
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4">
+                            <div>
+                                <p class="font-medium text-gray-800" x-text="agent.hostname || 'N/A'"></p>
+                                <p class="text-sm text-gray-500" x-text="agent.logical_agent_id"></p>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <div>
+                                <p class="font-mono text-sm" x-text="agent.instance_id"></p>
+                                <p class="text-sm text-gray-500" x-text="agent.instance_type + ' / ' + agent.az"></p>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-medium rounded"
+                                  :class="agent.current_mode === 'spot' ? 'bg-blue-100 text-blue-700' : 'bg-orange-100 text-orange-700'"
+                                  x-text="agent.current_mode"></span>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-medium rounded"
+                                  :class="{
+                                      'bg-green-100 text-green-700': agent.status === 'online',
+                                      'bg-gray-100 text-gray-700': agent.status === 'offline',
+                                      'bg-yellow-100 text-yellow-700': agent.status === 'disabled',
+                                      'bg-purple-100 text-purple-700': agent.status === 'switching'
+                                  }"
+                                  x-text="agent.status"></span>
+                        </td>
+                        <td class="px-6 py-4 text-sm text-gray-500" x-text="formatDate(agent.last_heartbeat_at)"></td>
+                        <td class="px-6 py-4">
+                            <div class="flex space-x-2">
+                                <button @click="toggleAgent(agent)"
+                                        class="px-3 py-1 text-sm rounded"
+                                        :class="agent.enabled ? 'bg-red-100 text-red-700 hover:bg-red-200' : 'bg-green-100 text-green-700 hover:bg-green-200'"
+                                        x-text="agent.enabled ? 'Disable' : 'Enable'">
+                                </button>
+                                <button @click="openSwitchModal(agent)"
+                                        class="px-3 py-1 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200">
+                                    Switch
+                                </button>
+                                <button @click="openSettingsModal(agent)"
+                                        class="px-3 py-1 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200">
+                                    Settings
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+
+        <div x-show="agents.length === 0" class="p-8 text-center text-gray-500">
+            No agents found
+        </div>
+    </div>
+
+    <!-- Switch Modal -->
+    <div x-show="showSwitchModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" x-cloak>
+        <div class="bg-white rounded-xl p-6 w-full max-w-md">
+            <h3 class="text-lg font-semibold mb-4">Manual Switch</h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Target Mode</label>
+                    <select x-model="switchForm.target_mode" class="w-full px-3 py-2 border rounded-lg">
+                        <option value="spot">Spot</option>
+                        <option value="ondemand">On-Demand</option>
+                    </select>
+                </div>
+                <div x-show="switchForm.target_mode === 'spot'">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Target Pool (AZ)</label>
+                    <select x-model="switchForm.target_pool_id" class="w-full px-3 py-2 border rounded-lg">
+                        <option value="">Auto-select best</option>
+                        <template x-for="pool in availablePools" :key="pool.pool_id">
+                            <option :value="pool.pool_id" x-text="pool.az + ' - $' + pool.price.toFixed(4) + '/hr'"></option>
+                        </template>
+                    </select>
+                </div>
+            </div>
+            <div class="flex justify-end space-x-3 mt-6">
+                <button @click="showSwitchModal = false" class="px-4 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                <button @click="executeSwitch()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Execute Switch</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div x-show="showSettingsModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" x-cloak>
+        <div class="bg-white rounded-xl p-6 w-full max-w-md">
+            <h3 class="text-lg font-semibold mb-4">Agent Settings</h3>
+            <div class="space-y-4">
+                <div class="flex items-center justify-between">
+                    <span class="text-sm font-medium text-gray-700">Auto Switch</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" x-model="settingsForm.auto_switch_enabled" class="sr-only peer">
+                        <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                </div>
+                <div class="flex items-center justify-between">
+                    <span class="text-sm font-medium text-gray-700">Auto Terminate</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" x-model="settingsForm.auto_terminate_enabled" class="sr-only peer">
+                        <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                </div>
+                <div class="flex items-center justify-between">
+                    <span class="text-sm font-medium text-gray-700">Manual Replica</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" x-model="settingsForm.manual_replica_enabled" class="sr-only peer">
+                        <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Replica Count</label>
+                    <input type="number" x-model="settingsForm.replica_count" min="0" max="5" class="w-full px-3 py-2 border rounded-lg">
+                </div>
+            </div>
+            <div class="flex justify-end space-x-3 mt-6">
+                <button @click="showSettingsModal = false" class="px-4 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                <button @click="saveSettings()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function agentsData() {
+    return {
+        agents: [],
+        showSwitchModal: false,
+        showSettingsModal: false,
+        selectedAgent: null,
+        availablePools: [],
+        switchForm: { target_mode: 'spot', target_pool_id: '' },
+        settingsForm: { auto_switch_enabled: false, auto_terminate_enabled: true, manual_replica_enabled: false, replica_count: 1 },
+
+        async fetchAgents() {
+            try {
+                const response = await fetch('/api/agents');
+                const data = await response.json();
+                this.agents = data.agents || [];
+            } catch (error) {
+                console.error('Failed to fetch agents:', error);
+            }
+        },
+
+        async toggleAgent(agent) {
+            try {
+                await fetch(`/api/agents/${agent.id}/toggle-enabled`, { method: 'POST' });
+                this.fetchAgents();
+            } catch (error) {
+                console.error('Failed to toggle agent:', error);
+            }
+        },
+
+        openSwitchModal(agent) {
+            this.selectedAgent = agent;
+            this.switchForm = { target_mode: agent.current_mode === 'spot' ? 'ondemand' : 'spot', target_pool_id: '' };
+            this.showSwitchModal = true;
+        },
+
+        async executeSwitch() {
+            try {
+                await fetch(`/api/agents/${this.selectedAgent.id}/switch`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(this.switchForm)
+                });
+                this.showSwitchModal = false;
+                this.fetchAgents();
+            } catch (error) {
+                console.error('Failed to execute switch:', error);
+            }
+        },
+
+        openSettingsModal(agent) {
+            this.selectedAgent = agent;
+            this.settingsForm = {
+                auto_switch_enabled: agent.auto_switch_enabled || false,
+                auto_terminate_enabled: agent.auto_terminate_enabled !== false,
+                manual_replica_enabled: agent.manual_replica_enabled || false,
+                replica_count: agent.replica_count || 1
+            };
+            this.showSettingsModal = true;
+        },
+
+        async saveSettings() {
+            try {
+                await fetch(`/api/agents/${this.selectedAgent.id}/settings`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(this.settingsForm)
+                });
+                this.showSettingsModal = false;
+                this.fetchAgents();
+            } catch (error) {
+                console.error('Failed to save settings:', error);
+            }
+        },
+
+        formatDate(dateStr) {
+            if (!dateStr) return 'Never';
+            const date = new Date(dateStr);
+            return date.toLocaleString();
+        }
+    }
+}
+</script>
+{% endblock %}

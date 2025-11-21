@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Instances - Spot Optimizer{% endblock %}
+
+{% block content %}
+<div x-data="instancesData()" x-init="fetchInstances()">
+    <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold text-gray-800">Instances</h1>
+        <button @click="fetchInstances()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Refresh</button>
+    </div>
+
+    <div class="bg-white rounded-xl shadow overflow-hidden">
+        <table class="w-full">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Instance ID</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Type</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Region/AZ</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Mode</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Price</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200">
+                <template x-for="instance in instances" :key="instance.id">
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 font-mono text-sm" x-text="instance.id"></td>
+                        <td class="px-6 py-4" x-text="instance.instance_type"></td>
+                        <td class="px-6 py-4 text-sm text-gray-500" x-text="instance.region + ' / ' + instance.az"></td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-medium rounded"
+                                  :class="instance.current_mode === 'spot' ? 'bg-blue-100 text-blue-700' : 'bg-orange-100 text-orange-700'"
+                                  x-text="instance.current_mode"></span>
+                        </td>
+                        <td class="px-6 py-4 text-sm">
+                            $<span x-text="(instance.spot_price || instance.ondemand_price || 0).toFixed(4)"></span>/hr
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-medium rounded"
+                                  :class="instance.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'"
+                                  x-text="instance.is_active ? 'Active' : 'Inactive'"></span>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+        <div x-show="instances.length === 0" class="p-8 text-center text-gray-500">No instances found</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function instancesData() {
+    return {
+        instances: [],
+        async fetchInstances() {
+            try {
+                const response = await fetch('/api/instances');
+                const data = await response.json();
+                this.instances = data.instances || [];
+            } catch (error) {
+                console.error('Failed to fetch instances:', error);
+            }
+        }
+    }
+}
+</script>
+{% endblock %}
