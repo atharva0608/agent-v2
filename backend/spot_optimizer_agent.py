@@ -1,0 +1,1413 @@
+"""
+AWS Spot Optimizer - Production Agent v4.0.0
+===========================================================================
+COMPLETE AGENT WITH FULL BACKEND INTEGRATION
+
+Features:
+- Instance switching (spot <-> on-demand)
+- Replica management (manual and emergency)
+- Termination notice handling (2-minute warning)
+- Rebalance recommendation checks
+- Cleanup operations (snapshots and AMIs)
+- Dual mode verification (AWS API + Instance Metadata)
+- Priority-based command execution
+- Graceful shutdown with cleanup
+===========================================================================
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import signal
+import logging
+import requests
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from urllib.parse import urljoin
+
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('spot_optimizer_agent.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class AgentConfig:
+    """Agent configuration with environment variable support"""
+
+    # Server Connection
+    SERVER_URL: str = os.getenv('SPOT_OPTIMIZER_SERVER_URL', 'http://localhost:5000')
+    CLIENT_TOKEN: str = os.getenv('SPOT_OPTIMIZER_CLIENT_TOKEN', '')
+
+    # Agent Identity
+    LOGICAL_AGENT_ID: str = os.getenv('LOGICAL_AGENT_ID', '')
+    HOSTNAME: str = socket.gethostname()
+
+    # AWS Configuration
+    REGION: str = os.getenv('AWS_REGION', 'us-east-1')
+
+    # Timing Configuration
+    HEARTBEAT_INTERVAL: int = int(os.getenv('HEARTBEAT_INTERVAL', 30))
+    PENDING_COMMANDS_CHECK_INTERVAL: int = int(os.getenv('PENDING_COMMANDS_CHECK_INTERVAL', 15))
+    CONFIG_REFRESH_INTERVAL: int = int(os.getenv('CONFIG_REFRESH_INTERVAL', 60))
+    PRICING_REPORT_INTERVAL: int = int(os.getenv('PRICING_REPORT_INTERVAL', 300))
+    TERMINATION_CHECK_INTERVAL: int = int(os.getenv('TERMINATION_CHECK_INTERVAL', 5))
+    REBALANCE_CHECK_INTERVAL: int = int(os.getenv('REBALANCE_CHECK_INTERVAL', 30))
+    CLEANUP_INTERVAL: int = int(os.getenv('CLEANUP_INTERVAL', 3600))  # 1 hour
+
+    # Switch Configuration
+    AUTO_TERMINATE_OLD_INSTANCE: bool = os.getenv('AUTO_TERMINATE_OLD_INSTANCE', 'true').lower() == 'true'
+    TERMINATE_WAIT_TIME: int = int(os.getenv('TERMINATE_WAIT_TIME', 300))
+    CREATE_SNAPSHOT_ON_SWITCH: bool = os.getenv('CREATE_SNAPSHOT_ON_SWITCH', 'true').lower() == 'true'
+
+    # Replica Configuration
+    REPLICA_ENABLED: bool = os.getenv('REPLICA_ENABLED', 'false').lower() == 'true'
+    REPLICA_COUNT: int = int(os.getenv('REPLICA_COUNT', 1))
+
+    # Cleanup Configuration
+    CLEANUP_SNAPSHOTS_OLDER_THAN_DAYS: int = int(os.getenv('CLEANUP_SNAPSHOTS_OLDER_THAN_DAYS', 7))
+    CLEANUP_AMIS_OLDER_THAN_DAYS: int = int(os.getenv('CLEANUP_AMIS_OLDER_THAN_DAYS', 30))
+
+    # Agent Version
+    AGENT_VERSION: str = '4.0.0'
+
+    def validate(self) -> bool:
+        """Validate required configuration"""
+        if not self.CLIENT_TOKEN:
+            logger.error("CLIENT_TOKEN not set!")
+            return False
+        if not self.SERVER_URL:
+            logger.error("SERVER_URL not set!")
+            return False
+        if not self.LOGICAL_AGENT_ID:
+            logger.warning("LOGICAL_AGENT_ID not set. Will use instance ID as logical ID.")
+        return True
+
+config = AgentConfig()
+
+# ============================================================================
+# AWS CLIENTS
+# ============================================================================
+
+class AWSClients:
+    """Singleton AWS client manager"""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+
+    def _initialize(self):
+        """Initialize AWS clients"""
+        try:
+            self.ec2 = boto3.client('ec2', region_name=config.REGION)
+            self.ec2_resource = boto3.resource('ec2', region_name=config.REGION)
+            logger.info(f"AWS clients initialized (region: {config.REGION})")
+        except Exception as e:
+            logger.error(f"Failed to initialize AWS clients: {e}")
+            raise
+
+aws_clients = AWSClients()
+
+# ============================================================================
+# INSTANCE METADATA & MODE DETECTION
+# ============================================================================
+
+class InstanceMetadata:
+    """Instance metadata and mode detection with dual verification"""
+
+    METADATA_BASE_URL = "http://169.254.169.254/latest"
+    METADATA_TIMEOUT = 2
+
+    @staticmethod
+    def get_metadata(path: str) -> Optional[str]:
+        """Fetch instance metadata using IMDSv2"""
+        try:
+            token_response = requests.put(
+                f"{InstanceMetadata.METADATA_BASE_URL}/api/token",
+                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                timeout=InstanceMetadata.METADATA_TIMEOUT
+            )
+            token = token_response.text
+
+            response = requests.get(
+                f"{InstanceMetadata.METADATA_BASE_URL}/{path}",
+                headers={"X-aws-ec2-metadata-token": token},
+                timeout=InstanceMetadata.METADATA_TIMEOUT
+            )
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            logger.debug(f"Metadata fetch failed for {path}: {e}")
+            return None
+
+    @staticmethod
+    def get_instance_id() -> str:
+        instance_id = InstanceMetadata.get_metadata("meta-data/instance-id")
+        if not instance_id:
+            raise RuntimeError("Cannot determine instance ID from metadata")
+        return instance_id
+
+    @staticmethod
+    def get_instance_type() -> str:
+        return InstanceMetadata.get_metadata("meta-data/instance-type") or "unknown"
+
+    @staticmethod
+    def get_availability_zone() -> str:
+        return InstanceMetadata.get_metadata("meta-data/placement/availability-zone") or "unknown"
+
+    @staticmethod
+    def get_ami_id() -> str:
+        return InstanceMetadata.get_metadata("meta-data/ami-id") or "unknown"
+
+    @staticmethod
+    def get_private_ip() -> str:
+        return InstanceMetadata.get_metadata("meta-data/local-ipv4") or "unknown"
+
+    @staticmethod
+    def get_public_ip() -> Optional[str]:
+        return InstanceMetadata.get_metadata("meta-data/public-ipv4")
+
+    @staticmethod
+    def check_spot_termination_notice() -> Optional[Dict]:
+        """
+        Check for spot instance termination notice
+        Returns termination time if notice exists, None otherwise
+        """
+        try:
+            action = InstanceMetadata.get_metadata("meta-data/spot/instance-action")
+            if action:
+                action_data = json.loads(action)
+                logger.warning(f"SPOT TERMINATION NOTICE: {action_data}")
+                return action_data
+            return None
+        except Exception as e:
+            logger.debug(f"No termination notice: {e}")
+            return None
+
+    @staticmethod
+    def check_rebalance_recommendation() -> bool:
+        """
+        Check for EC2 instance rebalance recommendation
+        Returns True if rebalance is recommended
+        """
+        try:
+            recommendation = InstanceMetadata.get_metadata("meta-data/events/recommendations/rebalance")
+            if recommendation:
+                logger.warning(f"REBALANCE RECOMMENDATION: {recommendation}")
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"No rebalance recommendation: {e}")
+            return False
+
+    @staticmethod
+    def detect_instance_mode_metadata() -> str:
+        """Detect mode from instance metadata"""
+        try:
+            spot_action = InstanceMetadata.get_metadata("meta-data/spot/instance-action")
+            if spot_action is not None:
+                return 'spot'
+
+            lifecycle = InstanceMetadata.get_metadata("meta-data/instance-life-cycle")
+            if lifecycle == 'spot':
+                return 'spot'
+            elif lifecycle == 'on-demand':
+                return 'ondemand'
+
+            return 'ondemand'
+        except Exception as e:
+            logger.warning(f"Metadata mode detection failed: {e}")
+            return 'unknown'
+
+    @staticmethod
+    def detect_instance_mode_api(instance_id: str) -> str:
+        """Detect mode from AWS EC2 API (more reliable)"""
+        try:
+            response = aws_clients.ec2.describe_instances(InstanceIds=[instance_id])
+
+            if not response['Reservations']:
+                return 'unknown'
+
+            instance = response['Reservations'][0]['Instances'][0]
+            lifecycle = instance.get('InstanceLifecycle', 'normal')
+
+            if lifecycle == 'spot':
+                return 'spot'
+            elif lifecycle == 'normal' or lifecycle == 'scheduled':
+                return 'ondemand'
+
+            return 'unknown'
+        except Exception as e:
+            logger.warning(f"API mode detection failed: {e}")
+            return 'unknown'
+
+    @staticmethod
+    def detect_instance_mode_dual() -> Tuple[str, str]:
+        """Dual verification of instance mode"""
+        instance_id = InstanceMetadata.get_instance_id()
+
+        metadata_mode = InstanceMetadata.detect_instance_mode_metadata()
+        api_mode = InstanceMetadata.detect_instance_mode_api(instance_id)
+
+        if metadata_mode != api_mode and metadata_mode != 'unknown' and api_mode != 'unknown':
+            logger.warning(f"Mode mismatch! Metadata={metadata_mode}, API={api_mode}")
+
+        final_mode = api_mode if api_mode != 'unknown' else metadata_mode
+
+        return final_mode, api_mode
+
+# ============================================================================
+# SERVER API CLIENT
+# ============================================================================
+
+class ServerAPI:
+    """API client for central server communication"""
+
+    def __init__(self):
+        self.base_url = config.SERVER_URL
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {config.CLIENT_TOKEN}',
+            'Content-Type': 'application/json'
+        })
+
+    def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict]:
+        """Make HTTP request with error handling"""
+        url = urljoin(self.base_url, endpoint)
+        try:
+            response = self.session.request(method, url, timeout=30, **kwargs)
+            response.raise_for_status()
+            return response.json() if response.text else {}
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout: {endpoint}")
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.error(f"Connection error: {endpoint}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error {response.status_code}: {endpoint} - {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Request failed: {endpoint} - {e}")
+            return None
+
+    def register_agent(self, instance_info: Dict) -> Optional[Dict]:
+        """Register agent with server"""
+        return self._make_request('POST', '/api/agents/register', json=instance_info)
+
+    def send_heartbeat(self, agent_id: str, status: str, monitored_instances: List[str],
+                       extra_data: Optional[Dict] = None) -> bool:
+        """Send heartbeat to server"""
+        payload = {
+            'status': status,
+            'monitored_instances': monitored_instances
+        }
+        if extra_data:
+            payload.update(extra_data)
+        result = self._make_request('POST', f'/api/agents/{agent_id}/heartbeat', json=payload)
+        return result is not None
+
+    def send_pricing_report(self, agent_id: str, report: Dict) -> bool:
+        """Send pricing report to server"""
+        result = self._make_request('POST', f'/api/agents/{agent_id}/pricing-report', json=report)
+        return result is not None
+
+    def get_agent_config(self, agent_id: str) -> Optional[Dict]:
+        """Get agent configuration"""
+        return self._make_request('GET', f'/api/agents/{agent_id}/config')
+
+    def get_pending_commands(self, agent_id: str) -> List[Dict]:
+        """Get pending commands with priority"""
+        result = self._make_request('GET', f'/api/agents/{agent_id}/pending-commands')
+        if not result:
+            return []
+        if isinstance(result, list):
+            return result
+        elif isinstance(result, dict):
+            return result.get('commands', result.get('pending_commands', result.get('data', [])))
+        return []
+
+    def mark_command_executed(self, agent_id: str, command_id: str, success: bool = True,
+                              message: str = "") -> bool:
+        """Mark command as executed"""
+        result = self._make_request(
+            'POST',
+            f'/api/agents/{agent_id}/commands/{command_id}/executed',
+            json={'success': success, 'message': message}
+        )
+        return result is not None
+
+    def send_switch_report(self, agent_id: str, switch_data: Dict) -> bool:
+        """Send detailed switch report with timing"""
+        result = self._make_request('POST', f'/api/agents/{agent_id}/switch-report', json=switch_data)
+        return result is not None
+
+    def report_termination_notice(self, agent_id: str, termination_data: Dict) -> Optional[Dict]:
+        """Report termination notice and get emergency instructions"""
+        return self._make_request('POST', f'/api/agents/{agent_id}/termination-imminent', json=termination_data)
+
+    def report_rebalance_recommendation(self, agent_id: str) -> Optional[Dict]:
+        """Report rebalance recommendation"""
+        return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={})
+
+    def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
+        """Create emergency replica"""
+        return self._make_request('POST', f'/api/agents/{agent_id}/create-emergency-replica', json=replica_data)
+
+    def get_replica_config(self, agent_id: str) -> Optional[Dict]:
+        """Get replica configuration"""
+        return self._make_request('GET', f'/api/agents/{agent_id}/replica-config')
+
+    def create_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
+        """Create manual replica"""
+        return self._make_request('POST', f'/api/agents/{agent_id}/replicas', json=replica_data)
+
+    def update_replica_status(self, agent_id: str, replica_id: str, status_data: Dict) -> bool:
+        """Update replica status"""
+        result = self._make_request(
+            'POST',
+            f'/api/agents/{agent_id}/replicas/{replica_id}/status',
+            json=status_data
+        )
+        return result is not None
+
+    def promote_replica(self, agent_id: str, replica_id: str) -> Optional[Dict]:
+        """Promote replica to primary"""
+        return self._make_request('POST', f'/api/agents/{agent_id}/replicas/{replica_id}/promote', json={})
+
+    def report_cleanup(self, agent_id: str, cleanup_data: Dict) -> bool:
+        """Report cleanup operations"""
+        result = self._make_request('POST', f'/api/agents/{agent_id}/cleanup-report', json=cleanup_data)
+        return result is not None
+
+# ============================================================================
+# SPOT PRICING COLLECTOR
+# ============================================================================
+
+class SpotPricingCollector:
+    """Collect spot pricing data for pools"""
+
+    def __init__(self):
+        self.ec2 = aws_clients.ec2
+        self._ondemand_cache = {}
+
+    def get_spot_pools(self, instance_type: str, region: str) -> List[Dict]:
+        """Get available spot pools for instance type"""
+        try:
+            response = self.ec2.describe_availability_zones(
+                Filters=[{'Name': 'region-name', 'Values': [region]}]
+            )
+
+            zones = [z['ZoneName'] for z in response['AvailabilityZones'] if z['State'] == 'available']
+
+            pools = []
+            for az in zones:
+                pool_id = f"{instance_type}.{az}"
+                price = self.get_spot_price(instance_type, az)
+
+                if price:
+                    pools.append({
+                        'pool_id': pool_id,
+                        'instance_type': instance_type,
+                        'az': az,
+                        'price': price
+                    })
+
+            return pools
+        except Exception as e:
+            logger.error(f"Failed to get spot pools: {e}")
+            return []
+
+    def get_spot_price(self, instance_type: str, az: str) -> Optional[float]:
+        """Get current spot price for instance type in AZ"""
+        try:
+            product_descriptions = ['Linux/UNIX (Amazon VPC)', 'Linux/UNIX']
+
+            for product_desc in product_descriptions:
+                try:
+                    response = self.ec2.describe_spot_price_history(
+                        InstanceTypes=[instance_type],
+                        AvailabilityZone=az,
+                        MaxResults=1,
+                        ProductDescriptions=[product_desc]
+                    )
+
+                    if response['SpotPriceHistory']:
+                        return float(response['SpotPriceHistory'][0]['SpotPrice'])
+                except Exception:
+                    continue
+
+            response = self.ec2.describe_spot_price_history(
+                InstanceTypes=[instance_type],
+                AvailabilityZone=az,
+                MaxResults=1
+            )
+
+            if response['SpotPriceHistory']:
+                return float(response['SpotPriceHistory'][0]['SpotPrice'])
+
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get spot price for {instance_type} in {az}: {e}")
+            return None
+
+    def get_ondemand_price(self, instance_type: str, region: str) -> float:
+        """Get on-demand price (from pricing API or fallback)"""
+        cache_key = f"{instance_type}:{region}"
+        if cache_key in self._ondemand_cache:
+            return self._ondemand_cache[cache_key]
+
+        try:
+            pricing = boto3.client('pricing', region_name='us-east-1')
+            location = self._region_to_location(region)
+
+            response = pricing.get_products(
+                ServiceCode='AmazonEC2',
+                Filters=[
+                    {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': location},
+                    {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'},
+                    {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
+                    {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'}
+                ],
+                MaxResults=1
+            )
+
+            if response['PriceList']:
+                price_data = json.loads(response['PriceList'][0])
+                terms = price_data['terms']['OnDemand']
+
+                for term in terms.values():
+                    for price_dim in term['priceDimensions'].values():
+                        price = float(price_dim['pricePerUnit']['USD'])
+                        self._ondemand_cache[cache_key] = price
+                        return price
+
+            # Fallback: estimate from spot price
+            spot_pools = self.get_spot_pools(instance_type, region)
+            if spot_pools:
+                avg_spot = sum(p['price'] for p in spot_pools) / len(spot_pools)
+                estimated_price = avg_spot * 3.0
+                self._ondemand_cache[cache_key] = estimated_price
+                return estimated_price
+
+            return 0.1
+        except Exception as e:
+            logger.error(f"Failed to get on-demand price: {e}")
+            return 0.1
+
+    def _region_to_location(self, region: str) -> str:
+        """Convert region code to pricing API location name"""
+        region_map = {
+            'us-east-1': 'US East (N. Virginia)',
+            'us-east-2': 'US East (Ohio)',
+            'us-west-1': 'US West (N. California)',
+            'us-west-2': 'US West (Oregon)',
+            'ap-south-1': 'Asia Pacific (Mumbai)',
+            'ap-northeast-1': 'Asia Pacific (Tokyo)',
+            'ap-southeast-1': 'Asia Pacific (Singapore)',
+            'ap-southeast-2': 'Asia Pacific (Sydney)',
+            'eu-west-1': 'EU (Ireland)',
+            'eu-central-1': 'EU (Frankfurt)',
+            'eu-west-2': 'EU (London)'
+        }
+        return region_map.get(region, region)
+
+# ============================================================================
+# CLEANUP MANAGER
+# ============================================================================
+
+class CleanupManager:
+    """Manage cleanup of old snapshots and AMIs"""
+
+    def __init__(self):
+        self.ec2 = aws_clients.ec2
+
+    def cleanup_old_snapshots(self, days_old: int = 7) -> Dict:
+        """Delete snapshots older than specified days"""
+        try:
+            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+
+            response = self.ec2.describe_snapshots(
+                OwnerIds=['self'],
+                Filters=[
+                    {'Name': 'tag:ManagedBy', 'Values': ['SpotOptimizer']},
+                    {'Name': 'status', 'Values': ['completed']}
+                ]
+            )
+
+            deleted = []
+            failed = []
+
+            for snapshot in response['Snapshots']:
+                start_time = snapshot['StartTime'].replace(tzinfo=None)
+                if start_time < cutoff_date:
+                    try:
+                        self.ec2.delete_snapshot(SnapshotId=snapshot['SnapshotId'])
+                        deleted.append(snapshot['SnapshotId'])
+                        logger.info(f"Deleted old snapshot: {snapshot['SnapshotId']}")
+                    except ClientError as e:
+                        if 'InvalidSnapshot.InUse' not in str(e):
+                            failed.append({'id': snapshot['SnapshotId'], 'error': str(e)})
+                            logger.warning(f"Failed to delete snapshot {snapshot['SnapshotId']}: {e}")
+
+            return {
+                'type': 'snapshots',
+                'deleted': deleted,
+                'failed': failed,
+                'cutoff_date': cutoff_date.isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Snapshot cleanup failed: {e}")
+            return {'type': 'snapshots', 'deleted': [], 'failed': [], 'error': str(e)}
+
+    def cleanup_old_amis(self, days_old: int = 30) -> Dict:
+        """Deregister AMIs older than specified days and delete associated snapshots"""
+        try:
+            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+
+            response = self.ec2.describe_images(
+                Owners=['self'],
+                Filters=[
+                    {'Name': 'tag:ManagedBy', 'Values': ['SpotOptimizer']}
+                ]
+            )
+
+            deleted_amis = []
+            deleted_snapshots = []
+            failed = []
+
+            for image in response['Images']:
+                creation_date = datetime.strptime(
+                    image['CreationDate'].split('.')[0], '%Y-%m-%dT%H:%M:%S'
+                )
+
+                if creation_date < cutoff_date:
+                    ami_id = image['ImageId']
+
+                    # Get associated snapshots
+                    snapshot_ids = [
+                        bdm['Ebs']['SnapshotId']
+                        for bdm in image.get('BlockDeviceMappings', [])
+                        if 'Ebs' in bdm and 'SnapshotId' in bdm['Ebs']
+                    ]
+
+                    try:
+                        # Deregister AMI
+                        self.ec2.deregister_image(ImageId=ami_id)
+                        deleted_amis.append(ami_id)
+                        logger.info(f"Deregistered old AMI: {ami_id}")
+
+                        # Delete associated snapshots
+                        for snap_id in snapshot_ids:
+                            try:
+                                self.ec2.delete_snapshot(SnapshotId=snap_id)
+                                deleted_snapshots.append(snap_id)
+                                logger.info(f"Deleted AMI snapshot: {snap_id}")
+                            except ClientError as e:
+                                failed.append({'id': snap_id, 'error': str(e)})
+                    except ClientError as e:
+                        failed.append({'id': ami_id, 'error': str(e)})
+                        logger.warning(f"Failed to deregister AMI {ami_id}: {e}")
+
+            return {
+                'type': 'amis',
+                'deleted_amis': deleted_amis,
+                'deleted_snapshots': deleted_snapshots,
+                'failed': failed,
+                'cutoff_date': cutoff_date.isoformat()
+            }
+        except Exception as e:
+            logger.error(f"AMI cleanup failed: {e}")
+            return {'type': 'amis', 'deleted_amis': [], 'deleted_snapshots': [], 'failed': [], 'error': str(e)}
+
+    def run_full_cleanup(self) -> Dict:
+        """Run full cleanup of snapshots and AMIs"""
+        logger.info("Starting cleanup operations...")
+
+        snapshot_result = self.cleanup_old_snapshots(config.CLEANUP_SNAPSHOTS_OLDER_THAN_DAYS)
+        ami_result = self.cleanup_old_amis(config.CLEANUP_AMIS_OLDER_THAN_DAYS)
+
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'snapshots': snapshot_result,
+            'amis': ami_result
+        }
+
+# ============================================================================
+# REPLICA MANAGER
+# ============================================================================
+
+class ReplicaManager:
+    """Manage replica instances"""
+
+    def __init__(self, server_api: ServerAPI):
+        self.server_api = server_api
+        self.ec2 = aws_clients.ec2
+        self.ec2_resource = aws_clients.ec2_resource
+        self.active_replicas: Dict[str, Dict] = {}
+
+    def create_replica(self, agent_id: str, primary_instance: Dict,
+                       replica_type: str = 'manual', target_pool_id: Optional[str] = None) -> Optional[str]:
+        """Create a replica instance"""
+        try:
+            logger.info(f"Creating {replica_type} replica...")
+
+            # Determine target AZ
+            if target_pool_id:
+                target_az = target_pool_id.split('.')[-1]
+            else:
+                target_az = primary_instance['az']
+
+            # Launch params
+            launch_params = {
+                'ImageId': primary_instance['ami_id'],
+                'InstanceType': primary_instance['instance_type'],
+                'MinCount': 1,
+                'MaxCount': 1,
+                'Placement': {'AvailabilityZone': target_az},
+                'TagSpecifications': [{
+                    'ResourceType': 'instance',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': f"SpotOptimizer-Replica-{replica_type}"},
+                        {'Key': 'ManagedBy', 'Value': 'SpotOptimizer'},
+                        {'Key': 'ReplicaType', 'Value': replica_type},
+                        {'Key': 'ParentInstance', 'Value': primary_instance['instance_id']},
+                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID}
+                    ]
+                }],
+                'InstanceMarketOptions': {
+                    'MarketType': 'spot',
+                    'SpotOptions': {
+                        'SpotInstanceType': 'one-time',
+                        'InstanceInterruptionBehavior': 'terminate'
+                    }
+                }
+            }
+
+            response = self.ec2.run_instances(**launch_params)
+            replica_instance_id = response['Instances'][0]['InstanceId']
+
+            logger.info(f"Replica instance launched: {replica_instance_id}")
+
+            # Wait for running state
+            waiter = self.ec2.get_waiter('instance_running')
+            waiter.wait(InstanceIds=[replica_instance_id])
+
+            # Register with server
+            replica_data = {
+                'instance_id': replica_instance_id,
+                'replica_type': replica_type,
+                'parent_instance_id': primary_instance['instance_id'],
+                'pool_id': f"{primary_instance['instance_type']}.{target_az}",
+                'status': 'ready'
+            }
+
+            result = self.server_api.create_replica(agent_id, replica_data)
+
+            if result:
+                replica_id = result.get('replica_id')
+                self.active_replicas[replica_id] = {
+                    'instance_id': replica_instance_id,
+                    'replica_type': replica_type,
+                    'status': 'ready'
+                }
+                logger.info(f"Replica registered: {replica_id}")
+                return replica_id
+
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create replica: {e}")
+            return None
+
+    def promote_replica(self, agent_id: str, replica_id: str) -> bool:
+        """Promote a replica to primary"""
+        try:
+            if replica_id not in self.active_replicas:
+                logger.error(f"Replica {replica_id} not found")
+                return False
+
+            replica = self.active_replicas[replica_id]
+
+            # Update server
+            result = self.server_api.promote_replica(agent_id, replica_id)
+
+            if result:
+                logger.info(f"Replica {replica_id} promoted to primary")
+                del self.active_replicas[replica_id]
+                return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Failed to promote replica: {e}")
+            return False
+
+    def terminate_replica(self, replica_id: str) -> bool:
+        """Terminate a replica instance"""
+        try:
+            if replica_id not in self.active_replicas:
+                return False
+
+            replica = self.active_replicas[replica_id]
+            instance_id = replica['instance_id']
+
+            self.ec2.terminate_instances(InstanceIds=[instance_id])
+
+            del self.active_replicas[replica_id]
+            logger.info(f"Replica {replica_id} terminated")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to terminate replica: {e}")
+            return False
+
+# ============================================================================
+# INSTANCE SWITCHER
+# ============================================================================
+
+class InstanceSwitcher:
+    """Handle instance switching with detailed timing"""
+
+    def __init__(self, server_api: ServerAPI):
+        self.server_api = server_api
+        self.ec2 = aws_clients.ec2
+        self.ec2_resource = aws_clients.ec2_resource
+        self.pricing_collector = SpotPricingCollector()
+
+    def execute_switch(self, command: Dict, current_instance_id: str) -> bool:
+        """Execute instance switch with detailed timing tracking"""
+        try:
+            target_mode = command['target_mode']
+            target_pool_id = command.get('target_pool_id')
+            agent_id = command.get('agent_id')
+
+            logger.info(f"Starting switch: {current_instance_id} -> {target_mode}")
+
+            timing = {
+                'switch_initiated_at': datetime.utcnow().isoformat() + 'Z',
+                'snapshot_created_at': None,
+                'ami_created_at': None,
+                'new_instance_launched_at': None,
+                'new_instance_ready_at': None,
+                'traffic_switched_at': None,
+                'old_instance_terminated_at': None
+            }
+
+            # Get current instance details
+            current_instance = self._get_instance_details(current_instance_id)
+            if not current_instance:
+                logger.error("Cannot get current instance details")
+                return False
+
+            # Step 1: Create AMI/snapshot if enabled
+            ami_id = None
+            snapshot_data = {'used': False}
+            if config.CREATE_SNAPSHOT_ON_SWITCH:
+                ami_result = self._create_ami(current_instance)
+                if ami_result:
+                    ami_id = ami_result['ami_id']
+                    snapshot_data = ami_result
+                    timing['ami_created_at'] = datetime.utcnow().isoformat() + 'Z'
+
+            # Step 2: Launch new instance
+            new_instance_id = self._launch_new_instance(
+                current_instance, target_mode, target_pool_id, ami_id
+            )
+
+            if not new_instance_id:
+                logger.error("Failed to launch new instance")
+                return False
+
+            timing['new_instance_launched_at'] = datetime.utcnow().isoformat() + 'Z'
+
+            # Wait for new instance to be ready
+            if not self._wait_for_instance_ready(new_instance_id):
+                logger.error("New instance failed to start")
+                self._cleanup_failed_switch(new_instance_id)
+                return False
+
+            timing['new_instance_ready_at'] = datetime.utcnow().isoformat() + 'Z'
+
+            # Get new instance details
+            new_instance = self._get_instance_details(new_instance_id)
+
+            # Step 3: Traffic switch point
+            logger.info("Traffic switch point - update load balancer/DNS")
+            time.sleep(2)
+            timing['traffic_switched_at'] = datetime.utcnow().isoformat() + 'Z'
+
+            # Step 4: Terminate old instance if auto-terminate enabled
+            if config.AUTO_TERMINATE_OLD_INSTANCE:
+                logger.info(f"Waiting {config.TERMINATE_WAIT_TIME}s before terminating old instance...")
+                time.sleep(config.TERMINATE_WAIT_TIME)
+
+                if self._terminate_instance(current_instance_id):
+                    timing['old_instance_terminated_at'] = datetime.utcnow().isoformat() + 'Z'
+                    logger.info(f"Old instance {current_instance_id} terminated")
+
+            # Collect pricing data
+            on_demand_price = self.pricing_collector.get_ondemand_price(
+                current_instance['instance_type'], config.REGION
+            )
+
+            prices = {'on_demand': on_demand_price}
+
+            if current_instance.get('current_mode') == 'spot':
+                old_spot = self.pricing_collector.get_spot_price(
+                    current_instance['instance_type'], current_instance['az']
+                )
+                prices['old_spot'] = old_spot
+
+            if target_mode == 'spot' and new_instance:
+                new_spot = self.pricing_collector.get_spot_price(
+                    new_instance['instance_type'], new_instance['az']
+                )
+                prices['new_spot'] = new_spot
+
+            # Send switch report
+            switch_report = {
+                'old_instance': {
+                    'instance_id': current_instance_id,
+                    'instance_type': current_instance['instance_type'],
+                    'region': config.REGION,
+                    'az': current_instance['az'],
+                    'ami_id': current_instance['ami_id'],
+                    'mode': current_instance.get('current_mode', 'unknown'),
+                    'pool_id': current_instance.get('current_pool_id')
+                },
+                'new_instance': {
+                    'instance_id': new_instance_id,
+                    'instance_type': new_instance['instance_type'] if new_instance else current_instance['instance_type'],
+                    'region': config.REGION,
+                    'az': new_instance['az'] if new_instance else target_pool_id.split('.')[-1] if target_pool_id else current_instance['az'],
+                    'ami_id': ami_id or current_instance['ami_id'],
+                    'mode': target_mode,
+                    'pool_id': target_pool_id
+                },
+                'snapshot': snapshot_data,
+                'prices': prices,
+                'timing': timing,
+                'trigger': 'manual' if command.get('priority', 0) >= 50 else 'model'
+            }
+
+            self.server_api.send_switch_report(agent_id, switch_report)
+
+            logger.info(f"Switch completed: {current_instance_id} -> {new_instance_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Switch execution failed: {e}", exc_info=True)
+            return False
+
+    def _get_instance_details(self, instance_id: str) -> Optional[Dict]:
+        """Get instance details from AWS"""
+        try:
+            response = self.ec2.describe_instances(InstanceIds=[instance_id])
+
+            if not response['Reservations']:
+                return None
+
+            instance = response['Reservations'][0]['Instances'][0]
+            lifecycle = instance.get('InstanceLifecycle', 'normal')
+            mode = 'spot' if lifecycle == 'spot' else 'ondemand'
+
+            return {
+                'instance_id': instance_id,
+                'instance_type': instance['InstanceType'],
+                'az': instance['Placement']['AvailabilityZone'],
+                'ami_id': instance['ImageId'],
+                'current_mode': mode,
+                'current_pool_id': f"{instance['InstanceType']}.{instance['Placement']['AvailabilityZone']}" if mode == 'spot' else None
+            }
+        except Exception as e:
+            logger.error(f"Failed to get instance details: {e}")
+            return None
+
+    def _create_ami(self, instance: Dict) -> Optional[Dict]:
+        """Create AMI from instance"""
+        try:
+            timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+            ami_name = f"SpotOptimizer-{instance['instance_id']}-{timestamp}"
+
+            response = self.ec2.create_image(
+                InstanceId=instance['instance_id'],
+                Name=ami_name,
+                Description=f"Spot Optimizer AMI - {datetime.utcnow().isoformat()}",
+                NoReboot=True,
+                TagSpecifications=[{
+                    'ResourceType': 'image',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': ami_name},
+                        {'Key': 'ManagedBy', 'Value': 'SpotOptimizer'},
+                        {'Key': 'SourceInstance', 'Value': instance['instance_id']}
+                    ]
+                }]
+            )
+
+            ami_id = response['ImageId']
+            logger.info(f"AMI created: {ami_id}")
+
+            # Wait for AMI to be available
+            waiter = self.ec2.get_waiter('image_available')
+            waiter.wait(ImageIds=[ami_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
+
+            return {
+                'used': True,
+                'ami_id': ami_id,
+                'ami_name': ami_name
+            }
+        except Exception as e:
+            logger.error(f"Failed to create AMI: {e}")
+            return None
+
+    def _launch_new_instance(self, current_instance: Dict, target_mode: str,
+                            target_pool_id: Optional[str], ami_id: Optional[str] = None) -> Optional[str]:
+        """Launch new instance"""
+        try:
+            launch_params = {
+                'ImageId': ami_id or current_instance['ami_id'],
+                'InstanceType': current_instance['instance_type'],
+                'MinCount': 1,
+                'MaxCount': 1,
+                'TagSpecifications': [{
+                    'ResourceType': 'instance',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': f"SpotOptimizer-{target_mode}"},
+                        {'Key': 'ManagedBy', 'Value': 'SpotOptimizer'},
+                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID}
+                    ]
+                }]
+            }
+
+            if target_mode == 'spot' and target_pool_id:
+                az = target_pool_id.split('.')[-1]
+                launch_params['Placement'] = {'AvailabilityZone': az}
+                launch_params['InstanceMarketOptions'] = {
+                    'MarketType': 'spot',
+                    'SpotOptions': {
+                        'SpotInstanceType': 'one-time',
+                        'InstanceInterruptionBehavior': 'terminate'
+                    }
+                }
+
+            response = self.ec2.run_instances(**launch_params)
+            new_instance_id = response['Instances'][0]['InstanceId']
+            logger.info(f"New instance launched: {new_instance_id}")
+
+            return new_instance_id
+        except Exception as e:
+            logger.error(f"Failed to launch instance: {e}")
+            return None
+
+    def _wait_for_instance_ready(self, instance_id: str, timeout: int = 300) -> bool:
+        """Wait for instance to be running"""
+        try:
+            instance = self.ec2_resource.Instance(instance_id)
+            instance.wait_until_running(
+                WaiterConfig={'Delay': 10, 'MaxAttempts': timeout // 10}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Instance failed to start: {e}")
+            return False
+
+    def _terminate_instance(self, instance_id: str) -> bool:
+        """Terminate instance with confirmation"""
+        try:
+            self.ec2.terminate_instances(InstanceIds=[instance_id])
+
+            instance = self.ec2_resource.Instance(instance_id)
+            instance.wait_until_terminated(WaiterConfig={'Delay': 15, 'MaxAttempts': 20})
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to terminate instance: {e}")
+            return False
+
+    def _cleanup_failed_switch(self, instance_id: str):
+        """Clean up after failed switch"""
+        try:
+            self.ec2.terminate_instances(InstanceIds=[instance_id])
+            logger.info(f"Cleaned up failed instance: {instance_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup instance: {e}")
+
+# ============================================================================
+# MAIN AGENT CLASS
+# ============================================================================
+
+class SpotOptimizerAgent:
+    """Main agent class - orchestrates all operations"""
+
+    def __init__(self):
+        self.server_api = ServerAPI()
+        self.pricing_collector = SpotPricingCollector()
+        self.instance_switcher = InstanceSwitcher(self.server_api)
+        self.cleanup_manager = CleanupManager()
+        self.replica_manager = ReplicaManager(self.server_api)
+
+        # Agent state
+        self.agent_id: Optional[str] = None
+        self.instance_id: str = InstanceMetadata.get_instance_id()
+        self.logical_agent_id: str = config.LOGICAL_AGENT_ID or self.instance_id
+        self.is_running = False
+        self.is_enabled = True
+
+        # Pricing cache
+        self.cached_instance_type: Optional[str] = None
+        self.cached_ondemand_price: Optional[float] = None
+
+        # Threads
+        self.threads: List[threading.Thread] = []
+        self.shutdown_event = threading.Event()
+
+        logger.info(f"Agent initialized: Instance={self.instance_id}, Logical={self.logical_agent_id}")
+
+    def start(self):
+        """Start the agent"""
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+
+            if not self._register():
+                logger.error("Failed to register agent. Exiting.")
+                return
+
+            # Cache on-demand price
+            self.cached_instance_type = InstanceMetadata.get_instance_type()
+            self.cached_ondemand_price = self.pricing_collector.get_ondemand_price(
+                self.cached_instance_type, config.REGION
+            )
+
+            self.is_running = True
+            self._start_workers()
+
+            logger.info("=" * 80)
+            logger.info(f"Agent started - ID: {self.agent_id}")
+            logger.info(f"Instance: {self.instance_id} ({self.cached_instance_type})")
+            logger.info(f"Version: {config.AGENT_VERSION}")
+            logger.info("=" * 80)
+
+            while self.is_running and not self.shutdown_event.is_set():
+                time.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Agent start failed: {e}", exc_info=True)
+        finally:
+            self._shutdown()
+
+    def _register(self) -> bool:
+        """Register with server"""
+        try:
+            instance_type = InstanceMetadata.get_instance_type()
+            az = InstanceMetadata.get_availability_zone()
+            ami_id = InstanceMetadata.get_ami_id()
+            private_ip = InstanceMetadata.get_private_ip()
+            public_ip = InstanceMetadata.get_public_ip()
+
+            current_mode, api_mode = InstanceMetadata.detect_instance_mode_dual()
+
+            registration_data = {
+                'client_token': config.CLIENT_TOKEN,
+                'hostname': config.HOSTNAME,
+                'instance_id': self.instance_id,
+                'instance_type': instance_type,
+                'region': config.REGION,
+                'az': az,
+                'ami_id': ami_id,
+                'agent_version': config.AGENT_VERSION,
+                'logical_agent_id': self.logical_agent_id,
+                'current_mode': current_mode,
+                'private_ip': private_ip,
+                'public_ip': public_ip
+            }
+
+            response = self.server_api.register_agent(registration_data)
+
+            if not response:
+                return False
+
+            self.agent_id = response['agent_id']
+            agent_config = response.get('config', {})
+            self.is_enabled = agent_config.get('enabled', True)
+
+            logger.info(f"Registered as agent: {self.agent_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Registration failed: {e}")
+            return False
+
+    def _start_workers(self):
+        """Start background worker threads"""
+        workers = [
+            (self._heartbeat_worker, "Heartbeat"),
+            (self._pending_commands_worker, "PendingCommands"),
+            (self._config_refresh_worker, "ConfigRefresh"),
+            (self._pricing_report_worker, "PricingReport"),
+            (self._termination_check_worker, "TerminationCheck"),
+            (self._rebalance_check_worker, "RebalanceCheck"),
+            (self._cleanup_worker, "Cleanup")
+        ]
+
+        for worker_func, worker_name in workers:
+            thread = threading.Thread(target=worker_func, name=worker_name, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+            logger.info(f"Started worker: {worker_name}")
+
+    def _heartbeat_worker(self):
+        """Send accurate heartbeat"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                status = 'online' if self.is_enabled else 'disabled'
+                self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id])
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
+
+            self.shutdown_event.wait(config.HEARTBEAT_INTERVAL)
+
+    def _pending_commands_worker(self):
+        """Fast polling for pending commands"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                if not self.is_enabled:
+                    self.shutdown_event.wait(config.PENDING_COMMANDS_CHECK_INTERVAL)
+                    continue
+
+                commands = self.server_api.get_pending_commands(self.agent_id)
+
+                if commands:
+                    logger.info(f"Found {len(commands)} pending command(s)")
+
+                    for command in commands:
+                        if not isinstance(command, dict):
+                            continue
+
+                        command_id = command.get('id')
+                        target_mode = command.get('target_mode')
+
+                        if not command_id or not target_mode:
+                            continue
+
+                        logger.info(f"Executing command {command_id}: {target_mode}")
+
+                        success = self.instance_switcher.execute_switch(
+                            {**command, 'agent_id': self.agent_id},
+                            self.instance_id
+                        )
+
+                        self.server_api.mark_command_executed(
+                            self.agent_id, command_id, success,
+                            "Switch completed" if success else "Switch failed"
+                        )
+
+                        if success and config.AUTO_TERMINATE_OLD_INSTANCE:
+                            self.is_running = False
+                            break
+
+                        break
+
+            except Exception as e:
+                logger.error(f"Pending commands error: {e}")
+
+            self.shutdown_event.wait(config.PENDING_COMMANDS_CHECK_INTERVAL)
+
+    def _config_refresh_worker(self):
+        """Periodically refresh configuration"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                agent_config = self.server_api.get_agent_config(self.agent_id)
+
+                if agent_config:
+                    new_enabled = agent_config.get('enabled', True)
+
+                    if new_enabled != self.is_enabled:
+                        logger.info(f"Agent enabled state changed: {self.is_enabled} -> {new_enabled}")
+                        self.is_enabled = new_enabled
+
+            except Exception as e:
+                logger.error(f"Config refresh error: {e}")
+
+            self.shutdown_event.wait(config.CONFIG_REFRESH_INTERVAL)
+
+    def _pricing_report_worker(self):
+        """Send pricing report"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                instance_type = InstanceMetadata.get_instance_type()
+                az = InstanceMetadata.get_availability_zone()
+                current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
+
+                spot_pools = self.pricing_collector.get_spot_pools(instance_type, config.REGION)
+                on_demand_price = self.cached_ondemand_price or self.pricing_collector.get_ondemand_price(
+                    instance_type, config.REGION
+                )
+
+                report = {
+                    'instance': {
+                        'instance_id': self.instance_id,
+                        'instance_type': instance_type,
+                        'region': config.REGION,
+                        'az': az,
+                        'current_mode': current_mode,
+                        'current_pool_id': f"{instance_type}.{az}" if current_mode == 'spot' else None
+                    },
+                    'on_demand_price': {'price': on_demand_price},
+                    'spot_pools': spot_pools
+                }
+
+                self.server_api.send_pricing_report(self.agent_id, report)
+                logger.info(f"Pricing report sent: {len(spot_pools)} pools")
+
+            except Exception as e:
+                logger.error(f"Pricing report error: {e}")
+
+            self.shutdown_event.wait(config.PRICING_REPORT_INTERVAL)
+
+    def _termination_check_worker(self):
+        """Check for spot termination notices"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
+
+                if current_mode == 'spot':
+                    termination_notice = InstanceMetadata.check_spot_termination_notice()
+
+                    if termination_notice:
+                        logger.warning("TERMINATION NOTICE DETECTED!")
+
+                        # Report to server and get emergency instructions
+                        response = self.server_api.report_termination_notice(
+                            self.agent_id,
+                            {
+                                'instance_id': self.instance_id,
+                                'action': termination_notice.get('action'),
+                                'time': termination_notice.get('time'),
+                                'detected_at': datetime.utcnow().isoformat()
+                            }
+                        )
+
+                        if response and response.get('create_emergency_replica'):
+                            # Create emergency replica
+                            current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                            if current_instance:
+                                self.replica_manager.create_replica(
+                                    self.agent_id, current_instance, 'emergency'
+                                )
+
+            except Exception as e:
+                logger.error(f"Termination check error: {e}")
+
+            self.shutdown_event.wait(config.TERMINATION_CHECK_INTERVAL)
+
+    def _rebalance_check_worker(self):
+        """Check for rebalance recommendations"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
+
+                if current_mode == 'spot':
+                    if InstanceMetadata.check_rebalance_recommendation():
+                        logger.warning("REBALANCE RECOMMENDATION DETECTED!")
+
+                        response = self.server_api.report_rebalance_recommendation(self.agent_id)
+
+                        if response and response.get('action') == 'switch':
+                            logger.info("Server recommends switch based on rebalance recommendation")
+
+            except Exception as e:
+                logger.error(f"Rebalance check error: {e}")
+
+            self.shutdown_event.wait(config.REBALANCE_CHECK_INTERVAL)
+
+    def _cleanup_worker(self):
+        """Periodic cleanup of old snapshots and AMIs"""
+        # Initial delay before first cleanup
+        self.shutdown_event.wait(60)
+
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                logger.info("Running cleanup operations...")
+                cleanup_result = self.cleanup_manager.run_full_cleanup()
+
+                # Report cleanup to server
+                self.server_api.report_cleanup(self.agent_id, cleanup_result)
+
+                snap_deleted = len(cleanup_result['snapshots'].get('deleted', []))
+                ami_deleted = len(cleanup_result['amis'].get('deleted_amis', []))
+
+                logger.info(f"Cleanup completed: {snap_deleted} snapshots, {ami_deleted} AMIs deleted")
+
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+
+            self.shutdown_event.wait(config.CLEANUP_INTERVAL)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.is_running = False
+        self.shutdown_event.set()
+
+    def _shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down agent...")
+
+        self.is_running = False
+        self.shutdown_event.set()
+
+        for thread in self.threads:
+            thread.join(timeout=5)
+
+        try:
+            self.server_api.send_heartbeat(self.agent_id, 'offline', [])
+        except:
+            pass
+
+        logger.info("Agent shutdown complete")
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    logger.info("=" * 80)
+    logger.info(f"AWS Spot Optimizer Agent v{config.AGENT_VERSION}")
+    logger.info("=" * 80)
+
+    if not config.validate():
+        logger.error("Configuration validation failed!")
+        sys.exit(1)
+
+    agent = SpotOptimizerAgent()
+    agent.start()
+
+if __name__ == '__main__':
+    main()
