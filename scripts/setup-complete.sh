@@ -126,6 +126,27 @@ if [ "$INSTALL_AGENT" = true ]; then
         exit 1
     fi
 
+    # Validate token with backend
+    print_info "Validating client token with server..."
+    VALIDATION_RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $CLIENT_TOKEN" "${SERVER_URL}/api/client/validate" 2>/dev/null)
+    HTTP_CODE=$(echo "$VALIDATION_RESPONSE" | tail -n1)
+    RESPONSE_BODY=$(echo "$VALIDATION_RESPONSE" | head -n -1)
+
+    if [ "$HTTP_CODE" = "200" ]; then
+        CLIENT_NAME=$(echo "$RESPONSE_BODY" | jq -r '.name // "Unknown"' 2>/dev/null || echo "Unknown")
+        print_success "Token validated successfully! Client: $CLIENT_NAME"
+    elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+        print_error "Invalid client token! Please check your token and try again."
+        print_error "Get your token from the admin dashboard at: $SERVER_URL"
+        exit 1
+    elif [ "$HTTP_CODE" = "000" ]; then
+        print_error "Cannot connect to server at: $SERVER_URL"
+        print_error "Please check the server URL and ensure the server is running."
+        exit 1
+    else
+        print_warning "Could not validate token (HTTP $HTTP_CODE). Proceeding anyway..."
+    fi
+
     read -p "Enter AWS Region [ap-south-1]: " AWS_REGION
     AWS_REGION=${AWS_REGION:-ap-south-1}
 
