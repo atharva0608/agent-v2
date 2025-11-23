@@ -24,7 +24,7 @@ import signal
 import logging
 import requests
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -376,7 +376,7 @@ class ServerAPI:
         """Report rebalance recommendation"""
         return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={
             'instance_id': instance_id,
-            'detected_at': datetime.now(datetime.UTC).isoformat()
+            'detected_at': datetime.now(timezone.utc).isoformat()
         })
 
     def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
@@ -555,7 +555,7 @@ class CleanupManager:
     def cleanup_old_snapshots(self, days_old: int = 7) -> Dict:
         """Delete snapshots older than specified days"""
         try:
-            cutoff_date = datetime.now(datetime.UTC) - timedelta(days=days_old)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
 
             response = self.ec2.describe_snapshots(
                 OwnerIds=['self'],
@@ -593,7 +593,7 @@ class CleanupManager:
     def cleanup_old_amis(self, days_old: int = 30) -> Dict:
         """Deregister AMIs older than specified days and delete associated snapshots"""
         try:
-            cutoff_date = datetime.now(datetime.UTC) - timedelta(days=days_old)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
 
             response = self.ec2.describe_images(
                 Owners=['self'],
@@ -658,7 +658,7 @@ class CleanupManager:
         ami_result = self.cleanup_old_amis(config.CLEANUP_AMIS_OLDER_THAN_DAYS)
 
         return {
-            'timestamp': datetime.now(datetime.UTC).isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'snapshots': snapshot_result,
             'amis': ami_result
         }
@@ -812,7 +812,7 @@ class InstanceSwitcher:
             logger.info(f"Starting FAST switch: {current_instance_id} -> {target_mode}")
 
             timing = {
-                'switch_initiated_at': datetime.now(datetime.UTC).isoformat(),
+                'switch_initiated_at': datetime.now(timezone.utc).isoformat(),
                 'snapshot_created_at': None,
                 'ami_created_at': None,
                 'new_instance_launched_at': None,
@@ -843,7 +843,7 @@ class InstanceSwitcher:
                 logger.error("Failed to launch new instance")
                 return False
 
-            timing['new_instance_launched_at'] = datetime.now(datetime.UTC).isoformat()
+            timing['new_instance_launched_at'] = datetime.now(timezone.utc).isoformat()
 
             # Wait for new instance to be ready
             if not self._wait_for_instance_ready(new_instance_id):
@@ -851,7 +851,7 @@ class InstanceSwitcher:
                 self._cleanup_failed_switch(new_instance_id)
                 return False
 
-            timing['new_instance_ready_at'] = datetime.now(datetime.UTC).isoformat()
+            timing['new_instance_ready_at'] = datetime.now(timezone.utc).isoformat()
 
             # Get new instance details
             new_instance = self._get_instance_details(new_instance_id)
@@ -859,7 +859,7 @@ class InstanceSwitcher:
             # Step 3: Traffic switch point
             logger.info("Traffic switch point - update load balancer/DNS")
             time.sleep(2)
-            timing['traffic_switched_at'] = datetime.now(datetime.UTC).isoformat()
+            timing['traffic_switched_at'] = datetime.now(timezone.utc).isoformat()
 
             # Step 4: Terminate old instance if auto-terminate enabled
             if config.AUTO_TERMINATE_OLD_INSTANCE:
@@ -867,7 +867,7 @@ class InstanceSwitcher:
                 time.sleep(config.TERMINATE_WAIT_TIME)
 
                 if self._terminate_instance(current_instance_id):
-                    timing['old_instance_terminated_at'] = datetime.now(datetime.UTC).isoformat()
+                    timing['old_instance_terminated_at'] = datetime.now(timezone.utc).isoformat()
                     logger.info(f"Old instance {current_instance_id} terminated")
 
             # Collect pricing data
@@ -963,13 +963,13 @@ class InstanceSwitcher:
     def _create_ami(self, instance: Dict) -> Optional[Dict]:
         """Create AMI from instance (SLOW - only use when necessary)"""
         try:
-            timestamp = datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S')
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
             ami_name = f"SpotOptimizer-{instance['instance_id']}-{timestamp}"
 
             response = self.ec2.create_image(
                 InstanceId=instance['instance_id'],
                 Name=ami_name,
-                Description=f"Spot Optimizer AMI - {datetime.now(datetime.UTC).isoformat()}",
+                Description=f"Spot Optimizer AMI - {datetime.now(timezone.utc).isoformat()}",
                 NoReboot=True,
                 TagSpecifications=[{
                     'ResourceType': 'image',
@@ -1356,7 +1356,7 @@ class SpotOptimizerAgent:
                         'current_spot_price': current_spot_price,
                         'cheapest_pool': cheapest_pool,
                         'spot_pools': spot_pools,
-                        'collected_at': datetime.now(datetime.UTC).isoformat()
+                        'collected_at': datetime.now(timezone.utc).isoformat()
                     }
                 }
 
@@ -1386,7 +1386,7 @@ class SpotOptimizerAgent:
                             {
                                 'instance_id': self.instance_id,
                                 'termination_time': termination_notice.get('time'),  # Backend expects 'termination_time'
-                                'detected_at': datetime.now(datetime.UTC).isoformat()
+                                'detected_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
 
