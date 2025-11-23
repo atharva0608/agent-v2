@@ -331,88 +331,53 @@ EOF
 fi
 
 # ==============================================================================
-# INSTALL DASHBOARD
+# INSTALL DASHBOARD (React Frontend)
 # ==============================================================================
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
-    print_header "Step 5: Installing Client Dashboard"
+    print_header "Step 5: Installing Client Dashboard (React)"
 
-    DASHBOARD_DIR="/opt/spot-optimizer-dashboard"
-    DASHBOARD_LOG_DIR="/var/log/spot-optimizer-dashboard"
+    DASHBOARD_DIR="/var/www/spot-optimizer-dashboard"
 
-    # Create directories
-    sudo mkdir -p $DASHBOARD_DIR $DASHBOARD_LOG_DIR
-    sudo chown $USER:$USER $DASHBOARD_DIR $DASHBOARD_LOG_DIR
+    # Create directory
+    sudo mkdir -p $DASHBOARD_DIR
+    sudo chown $USER:$USER $DASHBOARD_DIR
 
-    # Create Python virtual environment
-    print_info "Creating Python virtual environment..."
-    python3 -m venv $DASHBOARD_DIR/venv
-    source $DASHBOARD_DIR/venv/bin/activate
-
-    # Install Python dependencies
-    cat > $DASHBOARD_DIR/requirements.txt << 'EOF'
-flask>=3.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-gunicorn>=21.0.0
-EOF
-
-    pip install --quiet --upgrade pip
-    pip install --quiet -r $DASHBOARD_DIR/requirements.txt
-    print_success "Dashboard dependencies installed"
-
-    # Copy dashboard files
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    FRONTEND_DIR="$SCRIPT_DIR/../frontend"
-
-    if [ -d "$FRONTEND_DIR" ]; then
-        cp -r "$FRONTEND_DIR"/* $DASHBOARD_DIR/
-        print_success "Dashboard files copied"
+    # Install Node.js if not present
+    if ! command -v node &> /dev/null; then
+        print_info "Installing Node.js..."
+        if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        elif [ "$OS" = "amzn" ] || [ "$OS" = "centos" ] || [ "$OS" = "rhel" ]; then
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+            sudo yum install -y nodejs
+        fi
+        print_success "Node.js installed"
     else
-        print_error "Frontend directory not found at $FRONTEND_DIR"
+        print_success "Node.js already installed ($(node --version))"
+    fi
+
+    # Copy React frontend source
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    FRONTEND_SRC="$SCRIPT_DIR/../frontend-react"
+
+    if [ ! -d "$FRONTEND_SRC" ]; then
+        print_error "React frontend directory not found at $FRONTEND_SRC"
         exit 1
     fi
 
-    # Create dashboard configuration
-    cat > $DASHBOARD_DIR/.env << EOF
-FLASK_SECRET_KEY=$(openssl rand -hex 32)
-BACKEND_URL=$BACKEND_URL
-EOF
+    # Copy source and build
+    print_info "Building React dashboard..."
+    cp -r "$FRONTEND_SRC"/* $DASHBOARD_DIR/
+    cd $DASHBOARD_DIR
 
-    chmod 600 $DASHBOARD_DIR/.env
-    print_success "Dashboard configuration created"
+    # Install dependencies and build
+    npm install --quiet
+    npm run build
+    print_success "React dashboard built successfully"
 
-    # Create systemd service for dashboard
-    sudo tee /etc/systemd/system/spot-optimizer-dashboard.service > /dev/null << EOF
-[Unit]
-Description=AWS Spot Optimizer Client Dashboard
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$DASHBOARD_DIR
-Environment="FLASK_SECRET_KEY=$(openssl rand -hex 32)"
-Environment="BACKEND_URL=$BACKEND_URL"
-ExecStart=$DASHBOARD_DIR/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:3000 app:app
-Restart=always
-RestartSec=10
-StandardOutput=append:$DASHBOARD_LOG_DIR/dashboard.log
-StandardError=append:$DASHBOARD_LOG_DIR/dashboard-error.log
-
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable spot-optimizer-dashboard > /dev/null 2>&1
-    print_success "Dashboard systemd service created"
-
-    deactivate
+    # The dist folder contains the production build
 
     # ==============================================================================
     # CONFIGURE NGINX
@@ -420,23 +385,24 @@ EOF
 
     print_header "Step 6: Configuring Nginx (Port 80)"
 
-    # Create nginx configuration
+    # Create nginx configuration for React SPA + API proxy
     sudo tee /etc/nginx/sites-available/spot-optimizer-dashboard > /dev/null << 'EOF'
 server {
     listen 80;
     server_name _;
 
-    # Client Dashboard
-    location / {
-        proxy_pass http://127.0.0.1:3000;
+    # Serve React build
+    root /var/www/spot-optimizer-dashboard/dist;
+    index index.html;
+
+    # API proxy to Flask backend
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
         proxy_connect_timeout 60s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
@@ -447,6 +413,17 @@ server {
         access_log off;
         return 200 'OK';
         add_header Content-Type text/plain;
+    }
+
+    # Serve static files
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # SPA fallback - serve index.html for all routes
+    location / {
+        try_files $uri $uri/ /index.html;
     }
 }
 EOF
