@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}Switches - Spot Optimizer{% endblock %}
+
+{% block content %}
+<div x-data="switchesData()" x-init="fetchSwitches()">
+    <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold text-gray-800">Switch History</h1>
+        <button @click="fetchSwitches()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Refresh</button>
+    </div>
+
+    <div class="bg-white rounded-xl shadow overflow-hidden">
+        <table class="w-full">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Time</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">From</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">To</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Trigger</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Savings Impact</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200">
+                <template x-for="sw in switches" :key="sw.id">
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 text-sm" x-text="formatDate(sw.initiated_at)"></td>
+                        <td class="px-6 py-4">
+                            <div>
+                                <p class="font-mono text-sm" x-text="sw.old_instance_id"></p>
+                                <p class="text-xs text-gray-500">
+                                    <span x-text="sw.old_mode"></span> / <span x-text="sw.old_az"></span>
+                                </p>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <div>
+                                <p class="font-mono text-sm" x-text="sw.new_instance_id"></p>
+                                <p class="text-xs text-gray-500">
+                                    <span x-text="sw.new_mode"></span> / <span x-text="sw.new_az"></span>
+                                </p>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-medium rounded"
+                                  :class="sw.trigger_type === 'manual' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'"
+                                  x-text="sw.trigger_type || 'model'"></span>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span :class="sw.savings_impact > 0 ? 'text-green-600' : 'text-gray-600'" class="font-medium">
+                                $<span x-text="(sw.savings_impact || 0).toFixed(4)"></span>/hr
+                            </span>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+        <div x-show="switches.length === 0" class="p-8 text-center text-gray-500">No switches recorded</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function switchesData() {
+    return {
+        switches: [],
+        async fetchSwitches() {
+            try {
+                const response = await fetch('/api/switches');
+                const data = await response.json();
+                this.switches = data.switches || [];
+            } catch (error) {
+                console.error('Failed to fetch switches:', error);
+            }
+        },
+        formatDate(dateStr) {
+            if (!dateStr) return 'N/A';
+            return new Date(dateStr).toLocaleString();
+        }
+    }
+}
+</script>
+{% endblock %}

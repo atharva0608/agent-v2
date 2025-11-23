@@ -180,12 +180,18 @@ print_success "Python dependencies installed"
 # Copy Agent Script
 print_header "Step 5: Installing Production Agent Script"
 
-if [ -f "/tmp/spot_agent_production_v2_final.py" ]; then
-    cp /tmp/spot_agent_production_v2_final.py $APP_DIR/spot_agent.py
-    print_success "Agent script installed"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_FILE="$SCRIPT_DIR/../backend/spot_optimizer_agent.py"
+
+if [ -f "$AGENT_FILE" ]; then
+    cp "$AGENT_FILE" $APP_DIR/spot_agent.py
+    print_success "Agent script installed from $AGENT_FILE"
+elif [ -f "/tmp/spot_optimizer_agent.py" ]; then
+    cp /tmp/spot_optimizer_agent.py $APP_DIR/spot_agent.py
+    print_success "Agent script installed from /tmp/"
 else
-    print_error "Agent script not found at /tmp/spot_agent_production_v2_final.py"
-    print_info "Please ensure spot_agent_production_v2_final.py is in /tmp/"
+    print_error "Agent script not found"
+    print_info "Please ensure spot_optimizer_agent.py is in ../backend/ or /tmp/"
     exit 1
 fi
 

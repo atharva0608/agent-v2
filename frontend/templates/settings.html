@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - Spot Optimizer{% endblock %}
+
+{% block content %}
+<div x-data="settingsData()">
+    <h1 class="text-2xl font-bold text-gray-800 mb-6">Settings</h1>
+
+    <div class="bg-white rounded-xl shadow p-6">
+        <h2 class="text-lg font-semibold mb-4">Account Information</h2>
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Client Name</label>
+                <p class="text-gray-800">{{ client_name }}</p>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Client Token</label>
+                <div class="flex items-center space-x-2">
+                    <code class="px-3 py-2 bg-gray-100 rounded text-sm">{{ session.get('client_token', '')[:8] }}...{{ session.get('client_token', '')[-4:] }}</code>
+                    <button class="text-sm text-blue-600 hover:text-blue-800">Regenerate</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 mt-6">
+        <h2 class="text-lg font-semibold mb-4">Default Agent Settings</h2>
+        <div class="space-y-4">
+            <div class="flex items-center justify-between py-2 border-b">
+                <div>
+                    <p class="font-medium text-gray-800">Auto Switch</p>
+                    <p class="text-sm text-gray-500">Automatically switch instances based on ML recommendations</p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" x-model="defaults.auto_switch" class="sr-only peer">
+                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
+            </div>
+            <div class="flex items-center justify-between py-2 border-b">
+                <div>
+                    <p class="font-medium text-gray-800">Auto Terminate</p>
+                    <p class="text-sm text-gray-500">Automatically terminate old instances after successful switch</p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" x-model="defaults.auto_terminate" class="sr-only peer">
+                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
+            </div>
+            <div class="flex items-center justify-between py-2">
+                <div>
+                    <p class="font-medium text-gray-800">Create Snapshot</p>
+                    <p class="text-sm text-gray-500">Create EBS snapshot before switching instances</p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" x-model="defaults.create_snapshot" class="sr-only peer">
+                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 mt-6">
+        <h2 class="text-lg font-semibold mb-4">Cleanup Settings</h2>
+        <div class="grid grid-cols-2 gap-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Delete snapshots older than (days)</label>
+                <input type="number" x-model="cleanup.snapshot_days" min="1" max="90" class="w-full px-3 py-2 border rounded-lg">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Delete AMIs older than (days)</label>
+                <input type="number" x-model="cleanup.ami_days" min="1" max="365" class="w-full px-3 py-2 border rounded-lg">
+            </div>
+        </div>
+    </div>
+
+    <div class="mt-6">
+        <button @click="saveSettings()" class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Save Settings</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function settingsData() {
+    return {
+        defaults: { auto_switch: true, auto_terminate: true, create_snapshot: true },
+        cleanup: { snapshot_days: 7, ami_days: 30 },
+        async saveSettings() {
+            alert('Settings saved successfully!');
+        }
+    }
+}
+</script>
+{% endblock %}

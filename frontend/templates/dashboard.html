@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Spot Optimizer{% endblock %}
+
+{% block content %}
+<div x-data="dashboardData()" x-init="fetchStats()">
+    <h1 class="text-2xl font-bold text-gray-800 mb-6">Dashboard</h1>
+
+    <!-- Stats Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-gray-500">Total Agents</p>
+                    <p class="text-3xl font-bold text-gray-800" x-text="stats.total_agents || 0"></p>
+                </div>
+                <div class="p-3 bg-blue-100 rounded-lg">
+                    <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path>
+                    </svg>
+                </div>
+            </div>
+            <p class="text-sm text-green-600 mt-2">
+                <span x-text="stats.online_agents || 0"></span> online
+            </p>
+        </div>
+
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-gray-500">Active Instances</p>
+                    <p class="text-3xl font-bold text-gray-800" x-text="stats.active_instances || 0"></p>
+                </div>
+                <div class="p-3 bg-green-100 rounded-lg">
+                    <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path>
+                    </svg>
+                </div>
+            </div>
+            <p class="text-sm text-blue-600 mt-2">
+                <span x-text="stats.spot_instances || 0"></span> on spot
+            </p>
+        </div>
+
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-gray-500">Total Switches</p>
+                    <p class="text-3xl font-bold text-gray-800" x-text="stats.total_switches || 0"></p>
+                </div>
+                <div class="p-3 bg-purple-100 rounded-lg">
+                    <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path>
+                    </svg>
+                </div>
+            </div>
+            <p class="text-sm text-gray-500 mt-2">
+                <span x-text="stats.switches_today || 0"></span> today
+            </p>
+        </div>
+
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-gray-500">Total Savings</p>
+                    <p class="text-3xl font-bold text-green-600">$<span x-text="formatMoney(stats.total_savings)"></span></p>
+                </div>
+                <div class="p-3 bg-green-100 rounded-lg">
+                    <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                </div>
+            </div>
+            <p class="text-sm text-green-600 mt-2">
+                $<span x-text="formatMoney(stats.monthly_savings)"></span> this month
+            </p>
+        </div>
+    </div>
+
+    <!-- Recent Activity -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Recent Switches -->
+        <div class="bg-white rounded-xl shadow">
+            <div class="p-6 border-b">
+                <h2 class="text-lg font-semibold text-gray-800">Recent Switches</h2>
+            </div>
+            <div class="p-6">
+                <div class="space-y-4">
+                    <template x-for="sw in stats.recent_switches || []" :key="sw.id">
+                        <div class="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+                            <div>
+                                <p class="font-medium text-gray-800" x-text="sw.old_instance_id + ' -> ' + sw.new_instance_id"></p>
+                                <p class="text-sm text-gray-500" x-text="sw.old_mode + ' -> ' + sw.new_mode"></p>
+                            </div>
+                            <div class="text-right">
+                                <p class="text-sm font-medium" :class="sw.savings_impact > 0 ? 'text-green-600' : 'text-gray-600'">
+                                    $<span x-text="formatMoney(sw.savings_impact)"></span>/hr
+                                </p>
+                                <p class="text-xs text-gray-400" x-text="formatDate(sw.initiated_at)"></p>
+                            </div>
+                        </div>
+                    </template>
+                    <p x-show="!stats.recent_switches || stats.recent_switches.length === 0" class="text-gray-500 text-center py-4">
+                        No recent switches
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Agents -->
+        <div class="bg-white rounded-xl shadow">
+            <div class="p-6 border-b">
+                <h2 class="text-lg font-semibold text-gray-800">Active Agents</h2>
+            </div>
+            <div class="p-6">
+                <div class="space-y-4">
+                    <template x-for="agent in stats.active_agents || []" :key="agent.id">
+                        <div class="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+                            <div class="flex items-center">
+                                <div class="w-3 h-3 rounded-full mr-3" :class="agent.status === 'online' ? 'bg-green-500' : 'bg-gray-400'"></div>
+                                <div>
+                                    <p class="font-medium text-gray-800" x-text="agent.hostname || agent.instance_id"></p>
+                                    <p class="text-sm text-gray-500" x-text="agent.instance_type + ' / ' + agent.region"></p>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <span class="px-2 py-1 text-xs font-medium rounded"
+                                      :class="agent.current_mode === 'spot' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-700'"
+                                      x-text="agent.current_mode"></span>
+                            </div>
+                        </div>
+                    </template>
+                    <p x-show="!stats.active_agents || stats.active_agents.length === 0" class="text-gray-500 text-center py-4">
+                        No active agents
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function dashboardData() {
+    return {
+        stats: {},
+
+        async fetchStats() {
+            try {
+                const response = await fetch('/api/dashboard/stats');
+                this.stats = await response.json();
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+            }
+        },
+
+        formatMoney(value) {
+            return (value || 0).toFixed(2);
+        },
+
+        formatDate(dateStr) {
+            if (!dateStr) return '';
+            const date = new Date(dateStr);
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+        }
+    }
+}
+</script>
+{% endblock %}
