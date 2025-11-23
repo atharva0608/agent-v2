@@ -361,6 +361,7 @@ if [ "$INSTALL_DASHBOARD" = true ]; then
     # Copy React frontend source
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     FRONTEND_SRC="$SCRIPT_DIR/../frontend-react"
+    API_SRC="$SCRIPT_DIR/../frontend/api_server.py"
 
     if [ ! -d "$FRONTEND_SRC" ]; then
         print_error "React frontend directory not found at $FRONTEND_SRC"
@@ -377,7 +378,63 @@ if [ "$INSTALL_DASHBOARD" = true ]; then
     npm run build
     print_success "React dashboard built successfully"
 
-    # The dist folder contains the production build
+    # Setup API server
+    print_info "Setting up API server..."
+    API_DIR="/opt/spot-optimizer-api"
+    sudo mkdir -p $API_DIR
+    sudo chown $USER:$USER $API_DIR
+
+    # Copy API server
+    if [ -f "$API_SRC" ]; then
+        cp "$API_SRC" $API_DIR/api_server.py
+    else
+        print_error "API server not found at $API_SRC"
+        exit 1
+    fi
+
+    # Create Python virtual environment for API
+    python3 -m venv $API_DIR/venv
+    source $API_DIR/venv/bin/activate
+
+    # Install API dependencies
+    pip install --quiet flask flask-cors requests
+    print_success "API server dependencies installed"
+
+    # Read client token from agent config if it exists
+    if [ -f /etc/spot-optimizer/agent.env ]; then
+        source /etc/spot-optimizer/agent.env
+    fi
+
+    # Create systemd service for API
+    sudo tee /etc/systemd/system/spot-optimizer-api.service > /dev/null << EOF
+[Unit]
+Description=Spot Optimizer API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$API_DIR
+Environment="BACKEND_URL=$BACKEND_URL"
+Environment="CLIENT_TOKEN=${SPOT_OPTIMIZER_CLIENT_TOKEN:-}"
+Environment="PORT=5000"
+ExecStart=$API_DIR/venv/bin/python api_server.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/spot-optimizer/api.log
+StandardError=append:/var/log/spot-optimizer/api-error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable spot-optimizer-api > /dev/null 2>&1
+    sudo systemctl start spot-optimizer-api
+    print_success "API server configured and started"
+
+    deactivate
 
     # ==============================================================================
     # CONFIGURE NGINX
