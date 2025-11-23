@@ -896,7 +896,7 @@ class InstanceSwitcher:
 
             # Step 4: Terminate old instance based on command's terminate_wait_seconds
             # CRITICAL FIX: Respect command parameter, not config file
-            terminate_wait = command.get('terminate_wait_seconds', 0)
+            terminate_wait = command.get('terminate_wait_seconds') or 0
 
             if terminate_wait > 0:
                 logger.info(f"Auto-terminate enabled: waiting {terminate_wait}s before terminating old instance...")
@@ -1318,7 +1318,7 @@ class SpotOptimizerAgent:
                         )
 
                         # Stop agent if switch was successful AND old instance was terminated
-                        terminate_wait = command.get('terminate_wait_seconds', 0)
+                        terminate_wait = command.get('terminate_wait_seconds') or 0
                         if success and terminate_wait > 0:
                             logger.info("Old instance terminated, stopping agent...")
                             self.is_running = False
