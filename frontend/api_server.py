@@ -241,11 +241,20 @@ def get_pricing():
 
 @app.route('/api/pricing/history', methods=['GET'])
 def get_pricing_history():
-    """Get pricing history"""
+    """Get pricing history (7 days default)"""
     days = request.args.get('days', 7)
-    data = proxy_request(f'/api/client/pricing-history?days={days}')
+    agent_id = request.args.get('agent_id')  # Optional: filter by specific agent
+
+    # Build query parameters
+    params = {'days': days}
+    if agent_id:
+        params['agent_id'] = agent_id
+
+    query_string = '&'.join([f'{k}={v}' for k, v in params.items()])
+    data = proxy_request(f'/api/client/pricing-history?{query_string}')
+
     if 'error' in data:
-        # Return mock data if backend unavailable
+        # Return empty data if backend unavailable
         return jsonify({'history': []})
     return jsonify(data)
 
