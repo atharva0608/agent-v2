@@ -846,12 +846,9 @@ class InstanceSwitcher:
 
             timing = {
                 'switch_initiated_at': datetime.now(timezone.utc).isoformat(),
-                'snapshot_created_at': None,
-                'ami_created_at': None,
                 'new_instance_launched_at': None,
                 'new_instance_ready_at': None,
-                'traffic_switched_at': None,
-                'old_instance_terminated_at': None
+                'traffic_switched_at': None
             }
 
             # Get current instance details
