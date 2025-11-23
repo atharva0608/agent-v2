@@ -353,6 +353,26 @@ class ServerAPI:
             return result.get('commands', result.get('pending_commands', result.get('data', [])))
         return []
 
+    def get_pending_replicas(self, agent_id: str) -> List[Dict]:
+        """Get replicas that need to be launched by agent"""
+        result = self._make_request('GET', f'/api/agents/{agent_id}/replicas?status=launching')
+        if not result:
+            return []
+        if isinstance(result, list):
+            return result
+        elif isinstance(result, dict):
+            return result.get('replicas', [])
+        return []
+
+    def update_replica_instance(self, agent_id: str, replica_id: str, instance_id: str, status: str = 'syncing') -> bool:
+        """Update replica with actual EC2 instance ID"""
+        result = self._make_request(
+            'PUT',
+            f'/api/agents/{agent_id}/replicas/{replica_id}',
+            json={'instance_id': instance_id, 'status': status}
+        )
+        return result is not None
+
     def mark_command_executed(self, agent_id: str, command_id: str, success: bool = True,
                               message: str = "") -> bool:
         """Mark command as executed"""
@@ -1267,6 +1287,7 @@ class SpotOptimizerAgent:
         workers = [
             (self._heartbeat_worker, "Heartbeat"),
             (self._pending_commands_worker, "PendingCommands"),
+            (self._replica_polling_worker, "ReplicaPolling"),
             (self._config_refresh_worker, "ConfigRefresh"),
             (self._pricing_report_worker, "PricingReport"),
             (self._termination_check_worker, "TerminationCheck"),
@@ -1383,6 +1404,108 @@ class SpotOptimizerAgent:
                 logger.error(f"Pending commands error: {e}")
 
             self.shutdown_event.wait(config.PENDING_COMMANDS_CHECK_INTERVAL)
+
+    def _replica_polling_worker(self):
+        """Poll for replicas that need to be launched"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                # Poll for replicas with status='launching' that need EC2 instances
+                pending_replicas = self.server_api.get_pending_replicas(self.agent_id)
+
+                for replica in pending_replicas:
+                    replica_id = replica.get('id')
+                    pool_id = replica.get('pool_id')
+                    target_az = replica.get('az')
+
+                    if not all([replica_id, pool_id, target_az]):
+                        logger.warning(f"Invalid replica data: {replica}")
+                        continue
+
+                    logger.info(f"Launching EC2 instance for replica {replica_id} in AZ {target_az}")
+
+                    try:
+                        # Get current instance details to copy configuration
+                        current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                        if not current_instance:
+                            logger.error("Cannot get current instance details")
+                            continue
+
+                        # Launch replica instance with same config as current
+                        launch_params = {
+                            'ImageId': current_instance['ami_id'],
+                            'InstanceType': current_instance['instance_type'],
+                            'MinCount': 1,
+                            'MaxCount': 1,
+                            'Placement': {'AvailabilityZone': target_az},
+                            'TagSpecifications': [{
+                                'ResourceType': 'instance',
+                                'Tags': [
+                                    {'Key': 'Name', 'Value': f'replica-{replica_id[:8]}'},
+                                    {'Key': 'ReplicaId', 'Value': replica_id},
+                                    {'Key': 'ParentInstance', 'Value': self.instance_id}
+                                ]
+                            }]
+                        }
+
+                        # Copy IAM profile
+                        if current_instance.get('iam_instance_profile'):
+                            launch_params['IamInstanceProfile'] = {'Arn': current_instance['iam_instance_profile']}
+
+                        # Copy security groups
+                        if current_instance.get('security_groups'):
+                            launch_params['SecurityGroupIds'] = current_instance['security_groups']
+
+                        # Copy key pair
+                        if current_instance.get('key_name'):
+                            launch_params['KeyName'] = current_instance['key_name']
+
+                        # Launch spot instance
+                        launch_params['InstanceMarketOptions'] = {
+                            'MarketType': 'spot',
+                            'SpotOptions': {
+                                'SpotInstanceType': 'one-time',
+                                'InstanceInterruptionBehavior': 'terminate'
+                            }
+                        }
+
+                        response = self.instance_switcher.ec2.run_instances(**launch_params)
+                        replica_instance_id = response['Instances'][0]['InstanceId']
+                        logger.info(f"Replica instance launched: {replica_instance_id} for replica {replica_id}")
+
+                        # Update backend with real instance ID
+                        self.server_api.update_replica_instance(
+                            self.agent_id,
+                            replica_id,
+                            replica_instance_id,
+                            status='syncing'
+                        )
+
+                        # Wait for instance to be running
+                        waiter = self.instance_switcher.ec2.get_waiter('instance_running')
+                        waiter.wait(InstanceIds=[replica_instance_id])
+
+                        # Update status to ready
+                        self.server_api.update_replica_status(
+                            self.agent_id,
+                            replica_id,
+                            {'status': 'ready', 'sync_completed_at': datetime.now(timezone.utc).isoformat()}
+                        )
+                        logger.info(f"Replica {replica_id} is ready: {replica_instance_id}")
+
+                    except Exception as e:
+                        logger.error(f"Failed to launch replica {replica_id}: {e}")
+                        # Update replica status to failed
+                        self.server_api.update_replica_status(
+                            self.agent_id,
+                            replica_id,
+                            {'status': 'failed', 'error_message': str(e)}
+                        )
+
+            except Exception as e:
+                logger.error(f"Replica polling error: {e}")
+
+            # Poll every 30 seconds
+            self.shutdown_event.wait(30)
 
     def _config_refresh_worker(self):
         """Periodically refresh configuration"""
