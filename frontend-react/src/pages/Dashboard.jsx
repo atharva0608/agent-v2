@@ -67,6 +67,15 @@ const Dashboard = () => {
     return <LoadingSpinner message="Loading dashboard..." />;
   }
 
+  // Handle loading states and null data
+  const safeStats = stats || {
+    totalAgents: 0,
+    onlineAgents: 0,
+    spotAgents: 0,
+    savings: 0,
+    uptime: 0
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -85,27 +94,39 @@ const Dashboard = () => {
         </Button>
       </div>
 
+      {/* Connection Error Warning */}
+      {!stats && (
+        <div className="bg-yellow-50 border-l-4 border-yellow-500 p-4 rounded-lg">
+          <div className="flex items-center">
+            <Activity className="w-5 h-5 text-yellow-600 mr-3" />
+            <p className="text-yellow-800">
+              Unable to connect to backend API. Please check if the Flask API server is running on port 5000.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard
           title="Total Agents"
-          value={stats.totalAgents}
+          value={safeStats.totalAgents}
           icon={Server}
           trend="up"
-          trendValue={`${stats.onlineAgents} online`}
+          trendValue={`${safeStats.onlineAgents} online`}
           color="blue"
         />
         <StatCard
           title="Spot Instances"
-          value={stats.spotAgents}
+          value={safeStats.spotAgents}
           icon={TrendingUp}
           trend="up"
-          trendValue={`${Math.round((stats.spotAgents / Math.max(stats.totalAgents, 1)) * 100)}% of total`}
+          trendValue={`${Math.round((safeStats.spotAgents / Math.max(safeStats.totalAgents, 1)) * 100)}% of total`}
           color="green"
         />
         <StatCard
           title="Total Savings"
-          value={`$${stats.savings.toFixed(2)}`}
+          value={`$${safeStats.savings.toFixed(2)}`}
           icon={DollarSign}
           trend="up"
           trendValue="This month"
@@ -113,10 +134,10 @@ const Dashboard = () => {
         />
         <StatCard
           title="Uptime"
-          value={`${stats.uptime.toFixed(1)}%`}
+          value={`${safeStats.uptime.toFixed(1)}%`}
           icon={Clock}
-          trend={stats.uptime > 99 ? 'up' : 'neutral'}
-          trendValue={stats.uptime > 99 ? 'Excellent' : 'Good'}
+          trend={safeStats.uptime > 99 ? 'up' : 'neutral'}
+          trendValue={safeStats.uptime > 99 ? 'Excellent' : 'Good'}
           color="yellow"
         />
       </div>
