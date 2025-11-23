@@ -846,12 +846,9 @@ class InstanceSwitcher:
 
             timing = {
                 'switch_initiated_at': datetime.now(timezone.utc).isoformat(),
-                'snapshot_created_at': None,
-                'ami_created_at': None,
                 'new_instance_launched_at': None,
                 'new_instance_ready_at': None,
-                'traffic_switched_at': None,
-                'old_instance_terminated_at': None
+                'traffic_switched_at': None
             }
 
             # Get current instance details
@@ -896,7 +893,7 @@ class InstanceSwitcher:
 
             # Step 4: Terminate old instance based on command's terminate_wait_seconds
             # CRITICAL FIX: Respect command parameter, not config file
-            terminate_wait = command.get('terminate_wait_seconds', 0)
+            terminate_wait = command.get('terminate_wait_seconds') or 0
 
             if terminate_wait > 0:
                 logger.info(f"Auto-terminate enabled: waiting {terminate_wait}s before terminating old instance...")
@@ -1300,29 +1297,58 @@ class SpotOptimizerAgent:
                             continue
 
                         command_id = command.get('id')
-                        target_mode = command.get('target_mode')
+                        command_type = command.get('command_type', 'switch')  # Default to switch for backward compatibility
 
-                        if not command_id or not target_mode:
+                        if not command_id:
                             continue
 
-                        logger.info(f"Executing command {command_id}: {target_mode}")
+                        # Handle different command types
+                        if command_type == 'create_replica':
+                            # Manual replica creation command
+                            logger.info(f"Executing replica creation command {command_id}")
 
-                        success = self.instance_switcher.execute_switch(
-                            {**command, 'agent_id': self.agent_id},
-                            self.instance_id
-                        )
+                            success = False
+                            message = "Replica creation failed"
 
-                        self.server_api.mark_command_executed(
-                            self.agent_id, command_id, success,
-                            "Switch completed" if success else "Switch failed"
-                        )
+                            current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                            if current_instance:
+                                target_pool_id = command.get('target_pool_id')
+                                replica_id = self.replica_manager.create_replica(
+                                    self.agent_id, current_instance, 'manual', target_pool_id
+                                )
+                                if replica_id:
+                                    success = True
+                                    message = f"Replica created: {replica_id}"
+                                    logger.info(message)
 
-                        # Stop agent if switch was successful AND old instance was terminated
-                        terminate_wait = command.get('terminate_wait_seconds', 0)
-                        if success and terminate_wait > 0:
-                            logger.info("Old instance terminated, stopping agent...")
-                            self.is_running = False
-                            break
+                            self.server_api.mark_command_executed(
+                                self.agent_id, command_id, success, message
+                            )
+
+                        else:
+                            # Switch command (default)
+                            target_mode = command.get('target_mode')
+                            if not target_mode:
+                                continue
+
+                            logger.info(f"Executing switch command {command_id}: {target_mode}")
+
+                            success = self.instance_switcher.execute_switch(
+                                {**command, 'agent_id': self.agent_id},
+                                self.instance_id
+                            )
+
+                            self.server_api.mark_command_executed(
+                                self.agent_id, command_id, success,
+                                "Switch completed" if success else "Switch failed"
+                            )
+
+                            # Stop agent if switch was successful AND old instance was terminated
+                            terminate_wait = command.get('terminate_wait_seconds') or 0
+                            if success and terminate_wait > 0:
+                                logger.info("Old instance terminated, stopping agent...")
+                                self.is_running = False
+                                break
 
                         break
 
@@ -1434,11 +1460,16 @@ class SpotOptimizerAgent:
 
                         if response and response.get('create_emergency_replica'):
                             # Create emergency replica
+                            logger.info("Server recommends creating emergency replica")
                             current_instance = self.instance_switcher._get_instance_details(self.instance_id)
                             if current_instance:
-                                self.replica_manager.create_replica(
+                                replica_id = self.replica_manager.create_replica(
                                     self.agent_id, current_instance, 'emergency'
                                 )
+                                if replica_id:
+                                    logger.info(f"Emergency replica created: {replica_id}")
+                                else:
+                                    logger.error("Failed to create emergency replica")
 
             except Exception as e:
                 logger.error(f"Termination check error: {e}")
@@ -1457,8 +1488,21 @@ class SpotOptimizerAgent:
 
                         response = self.server_api.report_rebalance_recommendation(self.agent_id, self.instance_id)
 
-                        if response and response.get('action') == 'switch':
-                            logger.info("Server recommends switch based on rebalance recommendation")
+                        if response:
+                            # Handle emergency replica creation if recommended by server
+                            if response.get('create_emergency_replica'):
+                                logger.info("Server recommends creating emergency replica")
+                                current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                                if current_instance:
+                                    replica_id = self.replica_manager.create_replica(
+                                        self.agent_id, current_instance, 'emergency'
+                                    )
+                                    if replica_id:
+                                        logger.info(f"Emergency replica created: {replica_id}")
+
+                            # Handle immediate switch if recommended by server
+                            if response.get('action') == 'switch':
+                                logger.info("Server recommends immediate switch based on rebalance recommendation")
 
             except Exception as e:
                 logger.error(f"Rebalance check error: {e}")
