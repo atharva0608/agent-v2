@@ -1085,14 +1085,10 @@ class InstanceSwitcher:
             if current_instance.get('key_name'):
                 launch_params['KeyName'] = current_instance['key_name']
 
-            # Copy subnet
-            if current_instance.get('subnet_id'):
-                launch_params['SubnetId'] = current_instance['subnet_id']
-
             # Set placement and market options for target mode
             if target_mode == 'spot' and target_pool_id:
-                az = target_pool_id.split('.')[-1]
-                launch_params['Placement'] = {'AvailabilityZone': az}
+                target_az = target_pool_id.split('.')[-1]
+                launch_params['Placement'] = {'AvailabilityZone': target_az}
                 launch_params['InstanceMarketOptions'] = {
                     'MarketType': 'spot',
                     'SpotOptions': {
@@ -1100,6 +1096,18 @@ class InstanceSwitcher:
                         'InstanceInterruptionBehavior': 'terminate'
                     }
                 }
+
+                # Only copy subnet if staying in same AZ
+                current_az = current_instance.get('az', '')
+                if current_az == target_az and current_instance.get('subnet_id'):
+                    launch_params['SubnetId'] = current_instance['subnet_id']
+                    logger.info(f"Using existing subnet (same AZ: {target_az})")
+                else:
+                    logger.info(f"Switching AZ: {current_az} -> {target_az}, AWS will select subnet")
+            else:
+                # On-demand mode - copy subnet as-is (staying in same AZ)
+                if current_instance.get('subnet_id'):
+                    launch_params['SubnetId'] = current_instance['subnet_id']
 
             response = self.ec2.run_instances(**launch_params)
             new_instance_id = response['Instances'][0]['InstanceId']
