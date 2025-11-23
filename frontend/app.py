@@ -91,7 +91,7 @@ def logout():
 @login_required
 def dashboard():
     """Main dashboard"""
-    return render_template('dashboard.html', client_name=session.get('client_name', 'Client'))
+    return render_template('dashboard_modern.html', client_name=session.get('client_name', 'Client'))
 
 @app.route('/agents')
 @login_required
