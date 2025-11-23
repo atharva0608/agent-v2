@@ -379,9 +379,28 @@ class ServerAPI:
             'detected_at': datetime.now(timezone.utc).isoformat()
         })
 
-    def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
-        """Create emergency replica"""
-        return self._make_request('POST', f'/api/agents/{agent_id}/create-emergency-replica', json=replica_data)
+    def create_emergency_replica(self, agent_id: str, signal_type: str,
+                                  instance_id: str, termination_time: Optional[str] = None) -> Optional[Dict]:
+        """
+        Create emergency replica via backend endpoint.
+
+        Args:
+            agent_id: Agent ID
+            signal_type: 'rebalance-recommendation' or 'termination-notice'
+            instance_id: Current instance ID
+            termination_time: ISO timestamp for termination (required for termination-notice)
+
+        Returns:
+            Response from backend with replica details or error
+        """
+        payload = {
+            'signal_type': signal_type,
+            'instance_id': instance_id
+        }
+        if termination_time:
+            payload['termination_time'] = termination_time
+
+        return self._make_request('POST', f'/api/agents/{agent_id}/create-emergency-replica', json=payload)
 
     def get_replica_config(self, agent_id: str) -> Optional[Dict]:
         """Get replica configuration"""
@@ -1437,7 +1456,9 @@ class SpotOptimizerAgent:
             self.shutdown_event.wait(config.PRICING_REPORT_INTERVAL)
 
     def _termination_check_worker(self):
-        """Check for spot termination notices"""
+        """Check for spot termination notices (2-minute warning)"""
+        termination_already_handled = False  # Only handle once
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
@@ -1445,31 +1466,56 @@ class SpotOptimizerAgent:
                 if current_mode == 'spot':
                     termination_notice = InstanceMetadata.check_spot_termination_notice()
 
-                    if termination_notice:
-                        logger.warning("TERMINATION NOTICE DETECTED!")
+                    if termination_notice and not termination_already_handled:
+                        logger.critical(f"SPOT TERMINATION NOTICE DETECTED! Instance {self.instance_id} will be terminated!")
+                        termination_already_handled = True
 
-                        # Report to server and get emergency instructions
-                        response = self.server_api.report_termination_notice(
+                        termination_time = termination_notice.get('time')
+
+                        # CRITICAL PATH - 2 minutes to handle failover
+                        # Step 1: Try to create emergency replica via backend
+                        # Backend checks if replica already exists and skips if so
+                        logger.warning("Attempting emergency replica creation via backend...")
+                        replica_response = self.server_api.create_emergency_replica(
+                            self.agent_id,
+                            signal_type='termination-notice',
+                            instance_id=self.instance_id,
+                            termination_time=termination_time
+                        )
+
+                        if replica_response and replica_response.get('success'):
+                            replica_id = replica_response.get('replica_id')
+                            logger.info(f"Emergency replica created by backend: {replica_id}")
+                        else:
+                            logger.warning(f"Emergency replica creation skipped: {replica_response.get('error') if replica_response else 'No response'}")
+
+                        # Step 2: Report termination imminent to backend for failover
+                        # Backend will promote existing replica (created above or previously)
+                        logger.critical("Reporting termination imminent to backend for failover...")
+                        failover_response = self.server_api.report_termination_notice(
                             self.agent_id,
                             {
                                 'instance_id': self.instance_id,
-                                'termination_time': termination_notice.get('time'),  # Backend expects 'termination_time'
+                                'termination_time': termination_time,
                                 'detected_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
 
-                        if response and response.get('create_emergency_replica'):
-                            # Create emergency replica
-                            logger.info("Server recommends creating emergency replica")
-                            current_instance = self.instance_switcher._get_instance_details(self.instance_id)
-                            if current_instance:
-                                replica_id = self.replica_manager.create_replica(
-                                    self.agent_id, current_instance, 'emergency'
-                                )
-                                if replica_id:
-                                    logger.info(f"Emergency replica created: {replica_id}")
-                                else:
-                                    logger.error("Failed to create emergency replica")
+                        if failover_response:
+                            if failover_response.get('success'):
+                                logger.info(f"Failover successful: {failover_response.get('message')}")
+                                logger.info(f"New instance: {failover_response.get('new_instance_id')}")
+
+                                # Agent will be terminated by AWS in ~2 minutes
+                                # No need to continue running
+                                logger.info("Shutting down agent gracefully after successful failover")
+                                self.is_running = False
+                                return
+                            else:
+                                logger.error(f"Failover failed: {failover_response.get('error')}")
+                                logger.error("Agent will be terminated without successful failover")
+                        else:
+                            logger.error("No response from backend for termination failover")
 
             except Exception as e:
                 logger.error(f"Termination check error: {e}")
@@ -1478,31 +1524,55 @@ class SpotOptimizerAgent:
 
     def _rebalance_check_worker(self):
         """Check for rebalance recommendations"""
+        rebalance_already_reported = False  # Prevent duplicate reports
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
 
                 if current_mode == 'spot':
                     if InstanceMetadata.check_rebalance_recommendation():
-                        logger.warning("REBALANCE RECOMMENDATION DETECTED!")
+                        if not rebalance_already_reported:
+                            logger.warning("REBALANCE RECOMMENDATION DETECTED!")
+                            rebalance_already_reported = True
 
-                        response = self.server_api.report_rebalance_recommendation(self.agent_id, self.instance_id)
+                            # Step 1: Ask backend to create emergency replica
+                            # Backend will only create if auto_switch_enabled = TRUE
+                            logger.info("Requesting emergency replica from backend...")
+                            replica_response = self.server_api.create_emergency_replica(
+                                self.agent_id,
+                                signal_type='rebalance-recommendation',
+                                instance_id=self.instance_id
+                            )
 
-                        if response:
-                            # Handle emergency replica creation if recommended by server
-                            if response.get('create_emergency_replica'):
-                                logger.info("Server recommends creating emergency replica")
-                                current_instance = self.instance_switcher._get_instance_details(self.instance_id)
-                                if current_instance:
-                                    replica_id = self.replica_manager.create_replica(
-                                        self.agent_id, current_instance, 'emergency'
-                                    )
-                                    if replica_id:
-                                        logger.info(f"Emergency replica created: {replica_id}")
+                            if replica_response and replica_response.get('success'):
+                                replica_id = replica_response.get('replica_id')
+                                logger.info(f"Backend created emergency replica: {replica_id}")
 
-                            # Handle immediate switch if recommended by server
-                            if response.get('action') == 'switch':
-                                logger.info("Server recommends immediate switch based on rebalance recommendation")
+                                # Track locally
+                                if replica_id:
+                                    self.replica_manager.active_replicas[replica_id] = {
+                                        'instance_id': replica_response.get('replica_instance_id'),
+                                        'replica_type': 'emergency',
+                                        'status': 'launching'
+                                    }
+                            else:
+                                error_msg = replica_response.get('error') if replica_response else 'No response from backend'
+                                logger.warning(f"Emergency replica creation failed or disabled: {error_msg}")
+                                # This is OK - backend may have auto_switch disabled
+
+                            # Step 2: Report to monitoring endpoint
+                            monitoring_response = self.server_api.report_rebalance_recommendation(
+                                self.agent_id, self.instance_id
+                            )
+
+                            # Step 3: Handle additional actions if server recommends
+                            if monitoring_response and monitoring_response.get('action') == 'switch':
+                                logger.warning("Server recommends immediate switch - will be handled by pending commands")
+
+                    else:
+                        # Reset flag when rebalance signal clears
+                        rebalance_already_reported = False
 
             except Exception as e:
                 logger.error(f"Rebalance check error: {e}")
