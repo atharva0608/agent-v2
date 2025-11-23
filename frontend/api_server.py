@@ -38,6 +38,12 @@ def proxy_request(endpoint, method='GET', **kwargs):
 # AGENT ENDPOINTS
 # ============================================================================
 
+@app.route('/api/agents/register', methods=['POST'])
+def register_agent():
+    """Register a new agent"""
+    data = proxy_request('/api/agents/register', method='POST', json=request.json)
+    return jsonify(data)
+
 @app.route('/api/agents', methods=['GET'])
 def get_agents():
     """Get all agents for this client"""
@@ -48,6 +54,66 @@ def get_agents():
 def get_agent(agent_id):
     """Get single agent details"""
     data = proxy_request(f'/api/agents/{agent_id}')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/heartbeat', methods=['POST'])
+def agent_heartbeat(agent_id):
+    """Receive agent heartbeat"""
+    data = proxy_request(f'/api/agents/{agent_id}/heartbeat', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/config', methods=['GET'])
+def get_agent_config(agent_id):
+    """Get agent configuration"""
+    data = proxy_request(f'/api/agents/{agent_id}/config')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/pending-commands', methods=['GET'])
+def get_pending_commands(agent_id):
+    """Get pending commands for agent"""
+    data = proxy_request(f'/api/agents/{agent_id}/pending-commands')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/commands/<command_id>/executed', methods=['POST'])
+def mark_command_executed(agent_id, command_id):
+    """Mark command as executed"""
+    data = proxy_request(f'/api/agents/{agent_id}/commands/{command_id}/executed', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/pricing-report', methods=['POST'])
+def pricing_report(agent_id):
+    """Receive pricing report from agent"""
+    data = proxy_request(f'/api/agents/{agent_id}/pricing-report', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/switch-report', methods=['POST'])
+def switch_report(agent_id):
+    """Receive switch report from agent"""
+    data = proxy_request(f'/api/agents/{agent_id}/switch-report', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/cleanup-report', methods=['POST'])
+def cleanup_report(agent_id):
+    """Receive cleanup report from agent"""
+    data = proxy_request(f'/api/agents/{agent_id}/cleanup-report', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/termination-imminent', methods=['POST'])
+def termination_imminent(agent_id):
+    """Handle spot termination notice"""
+    data = proxy_request(f'/api/agents/{agent_id}/termination-imminent', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/rebalance-recommendation', methods=['POST'])
+def rebalance_recommendation(agent_id):
+    """Handle rebalance recommendation"""
+    data = proxy_request(f'/api/agents/{agent_id}/rebalance-recommendation', method='POST', json=request.json)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/create-emergency-replica', methods=['POST'])
+def create_emergency_replica(agent_id):
+    """Create emergency replica"""
+    data = proxy_request(f'/api/agents/{agent_id}/create-emergency-replica', method='POST', json=request.json)
     return jsonify(data)
 
 @app.route('/api/agents/stats', methods=['GET'])
@@ -96,19 +162,39 @@ def handle_replicas(agent_id):
     if request.method == 'POST':
         data = proxy_request(f'/api/agents/{agent_id}/replicas', method='POST', json=request.json)
     else:
-        data = proxy_request(f'/api/agents/{agent_id}/replicas')
+        # Pass query parameters (e.g., ?status=launching)
+        query_string = request.query_string.decode('utf-8')
+        endpoint = f'/api/agents/{agent_id}/replicas'
+        if query_string:
+            endpoint = f'{endpoint}?{query_string}'
+        data = proxy_request(endpoint)
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/replica-config', methods=['GET'])
+def get_replica_config(agent_id):
+    """Get replica configuration"""
+    data = proxy_request(f'/api/agents/{agent_id}/replica-config')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/replicas/<replica_id>', methods=['PUT', 'DELETE'])
+def handle_replica(agent_id, replica_id):
+    """Update or delete replica"""
+    if request.method == 'PUT':
+        data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}', method='PUT', json=request.json)
+    else:  # DELETE
+        data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}', method='DELETE')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/replicas/<replica_id>/status', methods=['POST'])
+def update_replica_status(agent_id, replica_id):
+    """Update replica status"""
+    data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}/status', method='POST', json=request.json)
     return jsonify(data)
 
 @app.route('/api/agents/<agent_id>/replicas/<replica_id>/promote', methods=['POST'])
 def promote_replica(agent_id, replica_id):
     """Promote replica to primary"""
     data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}/promote', method='POST')
-    return jsonify(data)
-
-@app.route('/api/agents/<agent_id>/replicas/<replica_id>', methods=['DELETE'])
-def delete_replica(agent_id, replica_id):
-    """Delete replica"""
-    data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}', method='DELETE')
     return jsonify(data)
 
 # ============================================================================
