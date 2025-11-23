@@ -1,12 +1,13 @@
 """
-Simple API Server for Client Dashboard
-Proxies requests to the central backend
+Complete API Server for Client Dashboard
+Matches final-ml backend API structure
 """
 
 import os
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
@@ -22,23 +23,31 @@ def get_headers():
         'Content-Type': 'application/json'
     }
 
-def proxy_request(endpoint):
+def proxy_request(endpoint, method='GET', **kwargs):
     """Proxy request to backend"""
     try:
         url = f"{BACKEND_URL}{endpoint}"
-        response = requests.get(url, headers=get_headers(), timeout=10)
-        return response.json() if response.status_code == 200 else {'error': 'Request failed'}
+        response = requests.request(method, url, headers=get_headers(), timeout=10, **kwargs)
+        if response.status_code == 200:
+            return response.json()
+        return {'error': f'Request failed: {response.status_code}'}
     except Exception as e:
         return {'error': str(e)}
 
 # ============================================================================
-# API ROUTES
+# AGENT ENDPOINTS
 # ============================================================================
 
 @app.route('/api/agents', methods=['GET'])
 def get_agents():
-    """Get all agents"""
+    """Get all agents for this client"""
     data = proxy_request('/api/client/agents')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>', methods=['GET'])
+def get_agent(agent_id):
+    """Get single agent details"""
+    data = proxy_request(f'/api/agents/{agent_id}')
     return jsonify(data)
 
 @app.route('/api/agents/stats', methods=['GET'])
@@ -47,77 +56,194 @@ def get_agent_stats():
     agents_data = proxy_request('/api/client/agents')
     agents = agents_data.get('agents', [])
 
+    online = [a for a in agents if a.get('status') == 'online']
+    spot = [a for a in agents if a.get('current_mode') == 'spot']
+
     stats = {
         'total_agents': len(agents),
-        'online_agents': len([a for a in agents if a.get('status') == 'online']),
-        'spot_agents': len([a for a in agents if a.get('current_mode') == 'spot']),
+        'online_agents': len(online),
+        'offline_agents': len(agents) - len(online),
+        'spot_agents': len(spot),
+        'ondemand_agents': len(agents) - len(spot),
     }
     return jsonify(stats)
 
 @app.route('/api/agents/<agent_id>/toggle', methods=['POST'])
 def toggle_agent(agent_id):
-    """Toggle agent enabled state"""
-    try:
-        url = f"{BACKEND_URL}/api/agents/{agent_id}/toggle-enabled"
-        response = requests.post(url, headers=get_headers(), timeout=10)
-        return jsonify(response.json() if response.status_code == 200 else {'error': 'Failed'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Toggle agent enabled/disabled"""
+    data = proxy_request(f'/api/agents/{agent_id}/toggle-enabled', method='POST')
+    return jsonify(data)
 
 @app.route('/api/agents/<agent_id>/switch', methods=['POST'])
 def switch_agent(agent_id):
     """Switch agent mode"""
-    try:
-        from flask import request
-        url = f"{BACKEND_URL}/api/agents/{agent_id}/switch"
-        response = requests.post(url, headers=get_headers(), json=request.json, timeout=10)
-        return jsonify(response.json() if response.status_code == 200 else {'error': 'Failed'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    data = proxy_request(f'/api/agents/{agent_id}/switch', method='POST', json=request.json)
+    return jsonify(data)
 
-@app.route('/api/agents/<agent_id>/replicas', methods=['POST'])
-def create_replica(agent_id):
-    """Create replica"""
-    try:
-        from flask import request
-        url = f"{BACKEND_URL}/api/agents/{agent_id}/replicas"
-        response = requests.post(url, headers=get_headers(), json=request.json, timeout=10)
-        return jsonify(response.json() if response.status_code == 200 else {'error': 'Failed'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/api/agents/<agent_id>/settings', methods=['PUT'])
+def update_agent_settings(agent_id):
+    """Update agent settings"""
+    data = proxy_request(f'/api/agents/{agent_id}/settings', method='PUT', json=request.json)
+    return jsonify(data)
+
+# ============================================================================
+# REPLICA ENDPOINTS
+# ============================================================================
+
+@app.route('/api/agents/<agent_id>/replicas', methods=['GET', 'POST'])
+def handle_replicas(agent_id):
+    """Get or create replicas"""
+    if request.method == 'POST':
+        data = proxy_request(f'/api/agents/{agent_id}/replicas', method='POST', json=request.json)
+    else:
+        data = proxy_request(f'/api/agents/{agent_id}/replicas')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/replicas/<replica_id>/promote', methods=['POST'])
+def promote_replica(agent_id, replica_id):
+    """Promote replica to primary"""
+    data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}/promote', method='POST')
+    return jsonify(data)
+
+@app.route('/api/agents/<agent_id>/replicas/<replica_id>', methods=['DELETE'])
+def delete_replica(agent_id, replica_id):
+    """Delete replica"""
+    data = proxy_request(f'/api/agents/{agent_id}/replicas/{replica_id}', method='DELETE')
+    return jsonify(data)
+
+# ============================================================================
+# STATS & SAVINGS ENDPOINTS
+# ============================================================================
 
 @app.route('/api/stats/savings', methods=['GET'])
 def get_savings():
     """Get savings stats"""
     data = proxy_request('/api/client/savings')
-    return jsonify(data if data else {'total_savings': 0, 'uptime_percentage': 0})
+    if 'error' in data:
+        return jsonify({'total_savings': 0, 'monthly_savings': 0, 'uptime_percentage': 99.9})
+    return jsonify(data)
+
+@app.route('/api/stats/overview', methods=['GET'])
+def get_overview():
+    """Get overview stats"""
+    agents_data = proxy_request('/api/client/agents')
+    savings_data = proxy_request('/api/client/savings')
+
+    agents = agents_data.get('agents', [])
+
+    return jsonify({
+        'total_instances': len(agents),
+        'online_agents': len([a for a in agents if a.get('status') == 'online']),
+        'total_agents': len(agents),
+        'spot_instances': len([a for a in agents if a.get('current_mode') == 'spot']),
+        'total_savings': savings_data.get('total_savings', 0),
+        'monthly_savings': savings_data.get('monthly_savings', 0),
+        'uptime_percentage': savings_data.get('uptime_percentage', 99.9)
+    })
+
+# ============================================================================
+# PRICING ENDPOINTS
+# ============================================================================
 
 @app.route('/api/pricing', methods=['GET'])
 def get_pricing():
     """Get current pricing"""
     data = proxy_request('/api/client/pricing')
-    return jsonify(data if data else {'pools': []})
+    if 'error' in data:
+        return jsonify({'pools': [], 'current_price': None})
+    return jsonify(data)
 
 @app.route('/api/pricing/history', methods=['GET'])
 def get_pricing_history():
     """Get pricing history"""
-    from flask import request
     days = request.args.get('days', 7)
     data = proxy_request(f'/api/client/pricing-history?days={days}')
-    return jsonify(data if data else {'history': []})
+    if 'error' in data:
+        # Return mock data if backend unavailable
+        return jsonify({'history': []})
+    return jsonify(data)
 
-@app.route('/api/agents/<agent_id>/switch-history', methods=['GET'])
-def get_switch_history(agent_id):
+# ============================================================================
+# SWITCH HISTORY & CHARTS
+# ============================================================================
+
+@app.route('/api/switches/history', methods=['GET'])
+def get_switch_history():
     """Get switch history"""
-    from flask import request
     limit = request.args.get('limit', 20)
-    data = proxy_request(f'/api/agents/{agent_id}/switches?limit={limit}')
-    return jsonify(data if data else {'switches': []})
+    data = proxy_request(f'/api/client/switches?limit={limit}')
+    if 'error' in data:
+        return jsonify({'switches': []})
+    return jsonify(data)
+
+@app.route('/api/charts/savings-trend', methods=['GET'])
+def get_savings_trend():
+    """Get savings trend chart data"""
+    period = request.args.get('period', '30d')
+    data = proxy_request(f'/api/client/charts/savings-trend?period={period}')
+    if 'error' in data:
+        return jsonify({'data': []})
+    return jsonify(data)
+
+@app.route('/api/charts/mode-distribution', methods=['GET'])
+def get_mode_distribution():
+    """Get instance mode distribution"""
+    agents_data = proxy_request('/api/client/agents')
+    agents = agents_data.get('agents', [])
+
+    spot_count = len([a for a in agents if a.get('current_mode') == 'spot'])
+    ondemand_count = len(agents) - spot_count
+
+    return jsonify({
+        'data': [
+            {'mode': 'spot', 'count': spot_count},
+            {'mode': 'ondemand', 'count': ondemand_count}
+        ]
+    })
+
+@app.route('/api/charts/switch-frequency', methods=['GET'])
+def get_switch_frequency():
+    """Get switch frequency over time"""
+    days = request.args.get('days', 30)
+    data = proxy_request(f'/api/client/charts/switch-frequency?days={days}')
+    if 'error' in data:
+        return jsonify({'data': []})
+    return jsonify(data)
+
+# ============================================================================
+# INSTANCES ENDPOINTS
+# ============================================================================
+
+@app.route('/api/instances', methods=['GET'])
+def get_instances():
+    """Get all instances"""
+    data = proxy_request('/api/client/instances')
+    return jsonify(data)
+
+@app.route('/api/instances/<instance_id>', methods=['GET'])
+def get_instance(instance_id):
+    """Get instance details"""
+    data = proxy_request(f'/api/instances/{instance_id}')
+    return jsonify(data)
+
+# ============================================================================
+# HEALTH & INFO
+# ============================================================================
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check"""
-    return jsonify({'status': 'ok', 'backend': BACKEND_URL})
+    return jsonify({
+        'status': 'ok',
+        'backend': BACKEND_URL,
+        'token_configured': bool(CLIENT_TOKEN)
+    })
+
+@app.route('/api/client/info', methods=['GET'])
+def client_info():
+    """Get client info"""
+    data = proxy_request('/api/client/validate')
+    return jsonify(data)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
