@@ -311,7 +311,24 @@ class ServerAPI:
             logger.error(f"Connection error: {endpoint}")
             return None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error {response.status_code}: {endpoint} - {response.text}")
+            # Enhanced logging for database connection pool issues
+            if response.status_code == 500:
+                error_text = response.text
+                if 'pool exhausted' in error_text.lower() or 'failed getting connection' in error_text.lower():
+                    logger.critical("=" * 80)
+                    logger.critical("DATABASE CONNECTION POOL EXHAUSTED ON CENTRAL SERVER!")
+                    logger.critical(f"Endpoint: {endpoint}")
+                    logger.critical("This is a BACKEND ISSUE in the central server (final-ml repo)")
+                    logger.critical("Action Required: Fix database connection pool configuration")
+                    logger.critical("  1. Check database connection pool size (SQLALCHEMY_POOL_SIZE)")
+                    logger.critical("  2. Check max overflow (SQLALCHEMY_MAX_OVERFLOW)")
+                    logger.critical("  3. Check pool recycle time (SQLALCHEMY_POOL_RECYCLE)")
+                    logger.critical("  4. Ensure database connections are properly closed")
+                    logger.critical("=" * 80)
+                else:
+                    logger.error(f"HTTP error {response.status_code}: {endpoint} - {error_text}")
+            else:
+                logger.error(f"HTTP error {response.status_code}: {endpoint} - {response.text}")
             return None
         except Exception as e:
             logger.error(f"Request failed: {endpoint} - {e}")
