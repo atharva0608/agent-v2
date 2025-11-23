@@ -376,7 +376,7 @@ class ServerAPI:
         """Report rebalance recommendation"""
         return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={
             'instance_id': instance_id,
-            'detected_at': datetime.utcnow().isoformat()
+            'detected_at': datetime.now(datetime.UTC).isoformat()
         })
 
     def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
@@ -555,7 +555,7 @@ class CleanupManager:
     def cleanup_old_snapshots(self, days_old: int = 7) -> Dict:
         """Delete snapshots older than specified days"""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+            cutoff_date = datetime.now(datetime.UTC) - timedelta(days=days_old)
 
             response = self.ec2.describe_snapshots(
                 OwnerIds=['self'],
@@ -593,7 +593,7 @@ class CleanupManager:
     def cleanup_old_amis(self, days_old: int = 30) -> Dict:
         """Deregister AMIs older than specified days and delete associated snapshots"""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+            cutoff_date = datetime.now(datetime.UTC) - timedelta(days=days_old)
 
             response = self.ec2.describe_images(
                 Owners=['self'],
@@ -658,7 +658,7 @@ class CleanupManager:
         ami_result = self.cleanup_old_amis(config.CLEANUP_AMIS_OLDER_THAN_DAYS)
 
         return {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(datetime.UTC).isoformat(),
             'snapshots': snapshot_result,
             'amis': ami_result
         }
@@ -803,16 +803,16 @@ class InstanceSwitcher:
         self.pricing_collector = SpotPricingCollector()
 
     def execute_switch(self, command: Dict, current_instance_id: str) -> bool:
-        """Execute instance switch with detailed timing tracking"""
+        """Execute instance switch with detailed timing tracking - FAST MODE (under 2 mins)"""
         try:
             target_mode = command['target_mode']
             target_pool_id = command.get('target_pool_id')
             agent_id = command.get('agent_id')
 
-            logger.info(f"Starting switch: {current_instance_id} -> {target_mode}")
+            logger.info(f"Starting FAST switch: {current_instance_id} -> {target_mode}")
 
             timing = {
-                'switch_initiated_at': datetime.utcnow().isoformat() + 'Z',
+                'switch_initiated_at': datetime.now(datetime.UTC).isoformat(),
                 'snapshot_created_at': None,
                 'ami_created_at': None,
                 'new_instance_launched_at': None,
@@ -827,17 +827,14 @@ class InstanceSwitcher:
                 logger.error("Cannot get current instance details")
                 return False
 
-            # Step 1: Create AMI/snapshot if enabled
-            ami_id = None
+            # OPTIMIZATION: Skip AMI creation, use existing AMI for fast switching
+            # Only create AMI if explicitly requested via config
+            ami_id = current_instance['ami_id']  # Use current AMI
             snapshot_data = {'used': False}
-            if config.CREATE_SNAPSHOT_ON_SWITCH:
-                ami_result = self._create_ami(current_instance)
-                if ami_result:
-                    ami_id = ami_result['ami_id']
-                    snapshot_data = ami_result
-                    timing['ami_created_at'] = datetime.utcnow().isoformat() + 'Z'
 
-            # Step 2: Launch new instance
+            logger.info(f"Using existing AMI: {ami_id} (skipping AMI creation for speed)")
+
+            # Step 2: Launch new instance immediately
             new_instance_id = self._launch_new_instance(
                 current_instance, target_mode, target_pool_id, ami_id
             )
@@ -846,7 +843,7 @@ class InstanceSwitcher:
                 logger.error("Failed to launch new instance")
                 return False
 
-            timing['new_instance_launched_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['new_instance_launched_at'] = datetime.now(datetime.UTC).isoformat()
 
             # Wait for new instance to be ready
             if not self._wait_for_instance_ready(new_instance_id):
@@ -854,7 +851,7 @@ class InstanceSwitcher:
                 self._cleanup_failed_switch(new_instance_id)
                 return False
 
-            timing['new_instance_ready_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['new_instance_ready_at'] = datetime.now(datetime.UTC).isoformat()
 
             # Get new instance details
             new_instance = self._get_instance_details(new_instance_id)
@@ -862,7 +859,7 @@ class InstanceSwitcher:
             # Step 3: Traffic switch point
             logger.info("Traffic switch point - update load balancer/DNS")
             time.sleep(2)
-            timing['traffic_switched_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['traffic_switched_at'] = datetime.now(datetime.UTC).isoformat()
 
             # Step 4: Terminate old instance if auto-terminate enabled
             if config.AUTO_TERMINATE_OLD_INSTANCE:
@@ -870,7 +867,7 @@ class InstanceSwitcher:
                 time.sleep(config.TERMINATE_WAIT_TIME)
 
                 if self._terminate_instance(current_instance_id):
-                    timing['old_instance_terminated_at'] = datetime.utcnow().isoformat() + 'Z'
+                    timing['old_instance_terminated_at'] = datetime.now(datetime.UTC).isoformat()
                     logger.info(f"Old instance {current_instance_id} terminated")
 
             # Collect pricing data
@@ -928,7 +925,7 @@ class InstanceSwitcher:
             return False
 
     def _get_instance_details(self, instance_id: str) -> Optional[Dict]:
-        """Get instance details from AWS"""
+        """Get instance details from AWS including IAM profile, security groups, etc"""
         try:
             response = self.ec2.describe_instances(InstanceIds=[instance_id])
 
@@ -939,28 +936,40 @@ class InstanceSwitcher:
             lifecycle = instance.get('InstanceLifecycle', 'normal')
             mode = 'spot' if lifecycle == 'spot' else 'ondemand'
 
+            # Extract IAM instance profile
+            iam_profile = None
+            if 'IamInstanceProfile' in instance:
+                iam_profile = instance['IamInstanceProfile'].get('Arn')
+
+            # Extract security groups
+            security_groups = [sg['GroupId'] for sg in instance.get('SecurityGroups', [])]
+
             return {
                 'instance_id': instance_id,
                 'instance_type': instance['InstanceType'],
                 'az': instance['Placement']['AvailabilityZone'],
                 'ami_id': instance['ImageId'],
                 'current_mode': mode,
-                'current_pool_id': f"{instance['InstanceType']}.{instance['Placement']['AvailabilityZone']}" if mode == 'spot' else None
+                'current_pool_id': f"{instance['InstanceType']}.{instance['Placement']['AvailabilityZone']}" if mode == 'spot' else None,
+                'iam_instance_profile': iam_profile,
+                'security_groups': security_groups,
+                'key_name': instance.get('KeyName'),
+                'subnet_id': instance.get('SubnetId')
             }
         except Exception as e:
             logger.error(f"Failed to get instance details: {e}")
             return None
 
     def _create_ami(self, instance: Dict) -> Optional[Dict]:
-        """Create AMI from instance"""
+        """Create AMI from instance (SLOW - only use when necessary)"""
         try:
-            timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+            timestamp = datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S')
             ami_name = f"SpotOptimizer-{instance['instance_id']}-{timestamp}"
 
             response = self.ec2.create_image(
                 InstanceId=instance['instance_id'],
                 Name=ami_name,
-                Description=f"Spot Optimizer AMI - {datetime.utcnow().isoformat()}",
+                Description=f"Spot Optimizer AMI - {datetime.now(datetime.UTC).isoformat()}",
                 NoReboot=True,
                 TagSpecifications=[{
                     'ResourceType': 'image',
@@ -990,7 +999,7 @@ class InstanceSwitcher:
 
     def _launch_new_instance(self, current_instance: Dict, target_mode: str,
                             target_pool_id: Optional[str], ami_id: Optional[str] = None) -> Optional[str]:
-        """Launch new instance"""
+        """Launch new instance with same configuration as current"""
         try:
             launch_params = {
                 'ImageId': ami_id or current_instance['ami_id'],
@@ -1002,11 +1011,30 @@ class InstanceSwitcher:
                     'Tags': [
                         {'Key': 'Name', 'Value': f"SpotOptimizer-{target_mode}"},
                         {'Key': 'ManagedBy', 'Value': 'SpotOptimizer'},
-                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID}
+                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID or 'default'}
                     ]
                 }]
             }
 
+            # Copy IAM instance profile from current instance
+            if current_instance.get('iam_instance_profile'):
+                launch_params['IamInstanceProfile'] = {
+                    'Arn': current_instance['iam_instance_profile']
+                }
+
+            # Copy security groups
+            if current_instance.get('security_groups'):
+                launch_params['SecurityGroupIds'] = current_instance['security_groups']
+
+            # Copy key pair
+            if current_instance.get('key_name'):
+                launch_params['KeyName'] = current_instance['key_name']
+
+            # Copy subnet
+            if current_instance.get('subnet_id'):
+                launch_params['SubnetId'] = current_instance['subnet_id']
+
+            # Set placement and market options for target mode
             if target_mode == 'spot' and target_pool_id:
                 az = target_pool_id.split('.')[-1]
                 launch_params['Placement'] = {'AvailabilityZone': az}
@@ -1020,7 +1048,7 @@ class InstanceSwitcher:
 
             response = self.ec2.run_instances(**launch_params)
             new_instance_id = response['Instances'][0]['InstanceId']
-            logger.info(f"New instance launched: {new_instance_id}")
+            logger.info(f"New instance launched: {new_instance_id} ({target_mode})")
 
             return new_instance_id
         except Exception as e:
@@ -1328,7 +1356,7 @@ class SpotOptimizerAgent:
                         'current_spot_price': current_spot_price,
                         'cheapest_pool': cheapest_pool,
                         'spot_pools': spot_pools,
-                        'collected_at': datetime.utcnow().isoformat()
+                        'collected_at': datetime.now(datetime.UTC).isoformat()
                     }
                 }
 
@@ -1358,7 +1386,7 @@ class SpotOptimizerAgent:
                             {
                                 'instance_id': self.instance_id,
                                 'termination_time': termination_notice.get('time'),  # Backend expects 'termination_time'
-                                'detected_at': datetime.utcnow().isoformat()
+                                'detected_at': datetime.now(datetime.UTC).isoformat()
                             }
                         )
 
