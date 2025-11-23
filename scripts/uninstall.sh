@@ -26,6 +26,27 @@ if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
     exit 0
 fi
 
+# Notify server before uninstall
+log_info "Notifying server of agent removal..."
+if [ -f /etc/spot-optimizer/agent.env ]; then
+    # Load configuration
+    source /etc/spot-optimizer/agent.env
+
+    # Get instance ID from metadata
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")
+
+    # Try to notify server (don't fail if server is unreachable)
+    if [ -n "$SPOT_OPTIMIZER_SERVER_URL" ] && [ -n "$SPOT_OPTIMIZER_CLIENT_TOKEN" ]; then
+        curl -s -X POST "${SPOT_OPTIMIZER_SERVER_URL}/api/agents/uninstall" \
+            -H "Authorization: Bearer ${SPOT_OPTIMIZER_CLIENT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"instance_id\": \"${INSTANCE_ID}\", \"reason\": \"manual_uninstall\"}" \
+            --max-time 10 2>/dev/null || log_warn "Could not notify server (continuing anyway)"
+    fi
+else
+    log_warn "Configuration not found, skipping server notification"
+fi
+
 # Stop and disable service
 log_info "Stopping service..."
 sudo systemctl stop spot-optimizer-agent 2>/dev/null || true

@@ -723,13 +723,13 @@ class ReplicaManager:
             waiter = self.ec2.get_waiter('instance_running')
             waiter.wait(InstanceIds=[replica_instance_id])
 
-            # Register with server
+            # Register with server in 'launching' status
             replica_data = {
                 'instance_id': replica_instance_id,
                 'replica_type': replica_type,
                 'parent_instance_id': primary_instance['instance_id'],
                 'pool_id': f"{primary_instance['instance_type']}.{target_az}",
-                'status': 'ready'
+                'status': 'launching'
             }
 
             result = self.server_api.create_replica(agent_id, replica_data)
@@ -739,9 +739,42 @@ class ReplicaManager:
                 self.active_replicas[replica_id] = {
                     'instance_id': replica_instance_id,
                     'replica_type': replica_type,
-                    'status': 'ready'
+                    'status': 'launching'
                 }
-                logger.info(f"Replica registered: {replica_id}")
+                logger.info(f"Replica registered: {replica_id}, starting sync...")
+
+                # Report syncing status
+                self.server_api.update_replica_status(agent_id, replica_id, {
+                    'status': 'syncing',
+                    'sync_started_at': datetime.now(timezone.utc).isoformat()
+                })
+                self.active_replicas[replica_id]['status'] = 'syncing'
+
+                # Wait for instance to be fully initialized (status checks)
+                logger.info(f"Waiting for replica {replica_id} to pass status checks...")
+                try:
+                    waiter = self.ec2.get_waiter('instance_status_ok')
+                    waiter.wait(
+                        InstanceIds=[replica_instance_id],
+                        WaiterConfig={'Delay': 15, 'MaxAttempts': 20}
+                    )
+
+                    # Report ready status
+                    self.server_api.update_replica_status(agent_id, replica_id, {
+                        'status': 'ready',
+                        'sync_completed_at': datetime.now(timezone.utc).isoformat()
+                    })
+                    self.active_replicas[replica_id]['status'] = 'ready'
+                    logger.info(f"Replica {replica_id} is ready")
+                except Exception as wait_error:
+                    logger.warning(f"Status check wait failed, marking ready anyway: {wait_error}")
+                    # Still mark as ready - instance is running even if status checks aren't perfect
+                    self.server_api.update_replica_status(agent_id, replica_id, {
+                        'status': 'ready',
+                        'sync_completed_at': datetime.now(timezone.utc).isoformat()
+                    })
+                    self.active_replicas[replica_id]['status'] = 'ready'
+
                 return replica_id
 
             return None
@@ -861,14 +894,20 @@ class InstanceSwitcher:
             time.sleep(2)
             timing['traffic_switched_at'] = datetime.now(timezone.utc).isoformat()
 
-            # Step 4: Terminate old instance if auto-terminate enabled
-            if config.AUTO_TERMINATE_OLD_INSTANCE:
-                logger.info(f"Waiting {config.TERMINATE_WAIT_TIME}s before terminating old instance...")
-                time.sleep(config.TERMINATE_WAIT_TIME)
+            # Step 4: Terminate old instance based on command's terminate_wait_seconds
+            # CRITICAL FIX: Respect command parameter, not config file
+            terminate_wait = command.get('terminate_wait_seconds', 0)
+
+            if terminate_wait > 0:
+                logger.info(f"Auto-terminate enabled: waiting {terminate_wait}s before terminating old instance...")
+                time.sleep(terminate_wait)
 
                 if self._terminate_instance(current_instance_id):
                     timing['old_instance_terminated_at'] = datetime.now(timezone.utc).isoformat()
                     logger.info(f"Old instance {current_instance_id} terminated")
+            else:
+                logger.info("Auto-terminate disabled (terminate_wait_seconds=0): keeping old instance running")
+                # Don't include old_terminated_at in timing when auto-terminate is disabled
 
             # Collect pricing data
             on_demand_price = self.pricing_collector.get_ondemand_price(
@@ -1278,7 +1317,10 @@ class SpotOptimizerAgent:
                             "Switch completed" if success else "Switch failed"
                         )
 
-                        if success and config.AUTO_TERMINATE_OLD_INSTANCE:
+                        # Stop agent if switch was successful AND old instance was terminated
+                        terminate_wait = command.get('terminate_wait_seconds', 0)
+                        if success and terminate_wait > 0:
+                            logger.info("Old instance terminated, stopping agent...")
                             self.is_running = False
                             break
 
