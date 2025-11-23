@@ -1414,8 +1414,16 @@ class SpotOptimizerAgent:
 
                 for replica in pending_replicas:
                     replica_id = replica.get('id')
+
+                    # Handle both flat and nested pool structures
                     pool_id = replica.get('pool_id')
                     target_az = replica.get('az')
+
+                    # If pool data is nested (final-ml backend format)
+                    if not pool_id and replica.get('pool'):
+                        pool_data = replica.get('pool')
+                        pool_id = pool_data.get('id')
+                        target_az = pool_data.get('az')
 
                     if not all([replica_id, pool_id, target_az]):
                         logger.warning(f"Invalid replica data: {replica}")
