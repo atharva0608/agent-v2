@@ -523,11 +523,11 @@ else
     echo -e "Agent Service:     \033[0;31m○ Stopped\033[0m"
 fi
 
-# Dashboard status
-if systemctl is-active --quiet spot-optimizer-dashboard 2>/dev/null; then
-    echo -e "Dashboard Service: \033[0;32m● Running\033[0m"
+# API Server status
+if systemctl is-active --quiet spot-optimizer-api 2>/dev/null; then
+    echo -e "API Service:       \033[0;32m● Running\033[0m"
 else
-    echo -e "Dashboard Service: \033[0;31m○ Stopped\033[0m"
+    echo -e "API Service:       \033[0;31m○ Stopped\033[0m"
 fi
 
 # Nginx status
@@ -556,7 +556,7 @@ sudo tee /usr/local/bin/spot-optimizer-restart > /dev/null << 'EOF'
 #!/bin/bash
 echo "Restarting Spot Optimizer services..."
 sudo systemctl restart spot-optimizer-agent 2>/dev/null || true
-sudo systemctl restart spot-optimizer-dashboard 2>/dev/null || true
+sudo systemctl restart spot-optimizer-api 2>/dev/null || true
 sudo systemctl restart nginx 2>/dev/null || true
 sleep 2
 spot-optimizer-status
@@ -569,7 +569,7 @@ sudo tee /usr/local/bin/spot-optimizer-logs > /dev/null << 'EOF'
 #!/bin/bash
 echo "Tailing all logs (Ctrl+C to stop)..."
 echo "═══════════════════════════════════════════════════════════════"
-tail -f /var/log/spot-optimizer/*.log /var/log/spot-optimizer-dashboard/*.log 2>/dev/null
+tail -f /var/log/spot-optimizer/*.log 2>/dev/null
 EOF
 sudo chmod +x /usr/local/bin/spot-optimizer-logs
 print_success "Created: spot-optimizer-logs"
@@ -581,7 +581,7 @@ print_success "Created: spot-optimizer-logs"
 print_header "Step 8: Configuring Log Rotation"
 
 sudo tee /etc/logrotate.d/spot-optimizer > /dev/null << EOF
-/var/log/spot-optimizer/*.log /var/log/spot-optimizer-dashboard/*.log {
+/var/log/spot-optimizer/*.log {
     daily
     rotate 7
     compress
@@ -592,7 +592,7 @@ sudo tee /etc/logrotate.d/spot-optimizer > /dev/null << EOF
     sharedscripts
     postrotate
         systemctl reload spot-optimizer-agent > /dev/null 2>&1 || true
-        systemctl reload spot-optimizer-dashboard > /dev/null 2>&1 || true
+        systemctl reload spot-optimizer-api > /dev/null 2>&1 || true
     endscript
 }
 EOF
@@ -618,22 +618,20 @@ if [ "$INSTALL_AGENT" = true ]; then
 fi
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
-    print_info "Starting dashboard service..."
-    sudo systemctl start spot-optimizer-dashboard
-    sleep 2
-    if sudo systemctl is-active --quiet spot-optimizer-dashboard; then
-        print_success "Dashboard service started"
-    else
-        print_error "Dashboard service failed to start"
-        print_info "Check logs: tail -50 /var/log/spot-optimizer-dashboard/dashboard.log"
-    fi
-
     print_info "Starting nginx..."
     sudo systemctl restart nginx
     if sudo systemctl is-active --quiet nginx; then
         print_success "Nginx started"
     else
         print_error "Nginx failed to start"
+    fi
+
+    # Verify API server is running
+    if sudo systemctl is-active --quiet spot-optimizer-api; then
+        print_success "API server is running"
+    else
+        print_warning "API server is not running"
+        print_info "Check logs: tail -50 /var/log/spot-optimizer/api.log"
     fi
 fi
 
@@ -659,8 +657,9 @@ fi
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
     print_info "Dashboard Installation:"
-    echo "  • Application: /opt/spot-optimizer-dashboard"
-    echo "  • Logs: /var/log/spot-optimizer-dashboard/"
+    echo "  • Frontend: /var/www/spot-optimizer-dashboard"
+    echo "  • API Server: /opt/spot-optimizer-api"
+    echo "  • Logs: /var/log/spot-optimizer/"
     echo ""
 
     DASHBOARD_URL="http://${PUBLIC_IP:-localhost}"
