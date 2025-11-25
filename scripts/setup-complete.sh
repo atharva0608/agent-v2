@@ -92,26 +92,62 @@ else
 fi
 
 # ==============================================================================
+# INSTANCE MEMORY - Check for previous installation
+# ==============================================================================
+
+INSTANCE_MEMORY_DIR="/var/lib/spot-optimizer"
+INSTANCE_MEMORY_FILE="$INSTANCE_MEMORY_DIR/instance-config.env"
+
+# Check if previous configuration exists
+REUSE_CONFIG=false
+if [ -f "$INSTANCE_MEMORY_FILE" ]; then
+    print_info "Previous installation detected!"
+    echo ""
+    cat "$INSTANCE_MEMORY_FILE" | grep -v "^#" | grep "=" || true
+    echo ""
+    read -p "Would you like to reuse the previous configuration? (y/n): " REUSE_ANSWER
+
+    if [[ "$REUSE_ANSWER" =~ ^[Yy]$ ]]; then
+        REUSE_CONFIG=true
+        print_success "Loading previous configuration..."
+        source "$INSTANCE_MEMORY_FILE"
+
+        # Override with saved values
+        INSTALL_AGENT=${SAVED_INSTALL_AGENT:-false}
+        INSTALL_DASHBOARD=${SAVED_INSTALL_DASHBOARD:-false}
+        SERVER_URL=${SAVED_SERVER_URL:-}
+        CLIENT_TOKEN=${SAVED_CLIENT_TOKEN:-}
+        AWS_REGION=${SAVED_AWS_REGION:-ap-south-1}
+        LOGICAL_AGENT_ID=${SAVED_LOGICAL_AGENT_ID:-}
+        BACKEND_URL=${SAVED_BACKEND_URL:-}
+
+        print_info "Previous configuration loaded successfully"
+    fi
+fi
+
+# ==============================================================================
 # USER INPUT
 # ==============================================================================
 
 print_header "Step 2: Configuration"
 
-echo "What would you like to install?"
-echo "  1) Agent only (for client EC2 instances)"
-echo "  2) Dashboard only (for management server)"
-echo "  3) Both Agent and Dashboard"
-echo ""
-read -p "Enter choice [1-3]: " INSTALL_CHOICE
+if [ "$REUSE_CONFIG" = false ]; then
+    echo "What would you like to install?"
+    echo "  1) Agent only (for client EC2 instances)"
+    echo "  2) Dashboard only (for management server)"
+    echo "  3) Both Agent and Dashboard"
+    echo ""
+    read -p "Enter choice [1-3]: " INSTALL_CHOICE
 
-case $INSTALL_CHOICE in
-    1) INSTALL_AGENT=true; INSTALL_DASHBOARD=false ;;
-    2) INSTALL_AGENT=false; INSTALL_DASHBOARD=true ;;
-    3) INSTALL_AGENT=true; INSTALL_DASHBOARD=true ;;
-    *) print_error "Invalid choice"; exit 1 ;;
-esac
+    case $INSTALL_CHOICE in
+        1) INSTALL_AGENT=true; INSTALL_DASHBOARD=false ;;
+        2) INSTALL_AGENT=false; INSTALL_DASHBOARD=true ;;
+        3) INSTALL_AGENT=true; INSTALL_DASHBOARD=true ;;
+        *) print_error "Invalid choice"; exit 1 ;;
+    esac
+fi
 
-if [ "$INSTALL_AGENT" = true ]; then
+if [ "$INSTALL_AGENT" = true ] && [ "$REUSE_CONFIG" = false ]; then
     echo ""
     read -p "Enter Central Server URL (e.g., http://10.0.1.50:5000): " SERVER_URL
     if [ -z "$SERVER_URL" ]; then
@@ -164,7 +200,7 @@ if [ "$INSTALL_AGENT" = true ]; then
     read -p "Enter Logical Agent ID (optional, press Enter to use instance ID): " LOGICAL_AGENT_ID
 fi
 
-if [ "$INSTALL_DASHBOARD" = true ]; then
+if [ "$INSTALL_DASHBOARD" = true ] && [ "$REUSE_CONFIG" = false ]; then
     echo ""
     # Default to SERVER_URL if agent is also being installed
     DEFAULT_BACKEND=${SERVER_URL:-http://localhost:5000}
@@ -172,6 +208,30 @@ if [ "$INSTALL_DASHBOARD" = true ]; then
     BACKEND_URL=${BACKEND_URL:-$DEFAULT_BACKEND}
     BACKEND_URL=${BACKEND_URL%/}
 fi
+
+# ==============================================================================
+# SAVE INSTANCE MEMORY
+# ==============================================================================
+
+# Save configuration for future reinstalls (survives uninstall)
+sudo mkdir -p "$INSTANCE_MEMORY_DIR"
+sudo tee "$INSTANCE_MEMORY_FILE" > /dev/null << EOF
+# Spot Optimizer Instance Memory
+# This file is preserved during uninstall to remember instance configuration
+# Generated: $(date)
+
+SAVED_INSTALL_AGENT=$INSTALL_AGENT
+SAVED_INSTALL_DASHBOARD=$INSTALL_DASHBOARD
+SAVED_SERVER_URL=$SERVER_URL
+SAVED_CLIENT_TOKEN=$CLIENT_TOKEN
+SAVED_AWS_REGION=$AWS_REGION
+SAVED_LOGICAL_AGENT_ID=$LOGICAL_AGENT_ID
+SAVED_BACKEND_URL=$BACKEND_URL
+SAVED_INSTANCE_ID=$INSTANCE_ID
+EOF
+
+sudo chmod 600 "$INSTANCE_MEMORY_FILE"
+print_info "Configuration saved for future reinstalls"
 
 echo ""
 print_warning "Installation Summary:"
@@ -331,86 +391,108 @@ EOF
 fi
 
 # ==============================================================================
-# INSTALL DASHBOARD
+# INSTALL DASHBOARD (React Frontend)
 # ==============================================================================
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
-    print_header "Step 5: Installing Client Dashboard"
+    print_header "Step 5: Installing Client Dashboard (React)"
 
-    DASHBOARD_DIR="/opt/spot-optimizer-dashboard"
-    DASHBOARD_LOG_DIR="/var/log/spot-optimizer-dashboard"
+    DASHBOARD_DIR="/var/www/spot-optimizer-dashboard"
 
-    # Create directories
-    sudo mkdir -p $DASHBOARD_DIR $DASHBOARD_LOG_DIR
-    sudo chown $USER:$USER $DASHBOARD_DIR $DASHBOARD_LOG_DIR
+    # Create directory
+    sudo mkdir -p $DASHBOARD_DIR
+    sudo chown $USER:$USER $DASHBOARD_DIR
 
-    # Create Python virtual environment
-    print_info "Creating Python virtual environment..."
-    python3 -m venv $DASHBOARD_DIR/venv
-    source $DASHBOARD_DIR/venv/bin/activate
-
-    # Install Python dependencies
-    cat > $DASHBOARD_DIR/requirements.txt << 'EOF'
-flask>=3.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-gunicorn>=21.0.0
-EOF
-
-    pip install --quiet --upgrade pip
-    pip install --quiet -r $DASHBOARD_DIR/requirements.txt
-    print_success "Dashboard dependencies installed"
-
-    # Copy dashboard files
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    FRONTEND_DIR="$SCRIPT_DIR/../frontend"
-
-    if [ -d "$FRONTEND_DIR" ]; then
-        cp -r "$FRONTEND_DIR"/* $DASHBOARD_DIR/
-        print_success "Dashboard files copied"
+    # Install Node.js if not present
+    if ! command -v node &> /dev/null; then
+        print_info "Installing Node.js..."
+        if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        elif [ "$OS" = "amzn" ] || [ "$OS" = "centos" ] || [ "$OS" = "rhel" ]; then
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+            sudo yum install -y nodejs
+        fi
+        print_success "Node.js installed"
     else
-        print_error "Frontend directory not found at $FRONTEND_DIR"
+        print_success "Node.js already installed ($(node --version))"
+    fi
+
+    # Copy React frontend source
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    FRONTEND_SRC="$SCRIPT_DIR/../frontend-react"
+    API_SRC="$SCRIPT_DIR/../frontend/api_server.py"
+
+    if [ ! -d "$FRONTEND_SRC" ]; then
+        print_error "React frontend directory not found at $FRONTEND_SRC"
         exit 1
     fi
 
-    # Create dashboard configuration
-    cat > $DASHBOARD_DIR/.env << EOF
-FLASK_SECRET_KEY=$(openssl rand -hex 32)
-BACKEND_URL=$BACKEND_URL
-EOF
+    # Copy source and build
+    print_info "Building React dashboard..."
+    cp -r "$FRONTEND_SRC"/* $DASHBOARD_DIR/
+    cd $DASHBOARD_DIR
 
-    chmod 600 $DASHBOARD_DIR/.env
-    print_success "Dashboard configuration created"
+    # Install dependencies and build
+    npm install --quiet
+    npm run build
+    print_success "React dashboard built successfully"
 
-    # Create systemd service for dashboard
-    sudo tee /etc/systemd/system/spot-optimizer-dashboard.service > /dev/null << EOF
+    # Setup API server
+    print_info "Setting up API server..."
+    API_DIR="/opt/spot-optimizer-api"
+    sudo mkdir -p $API_DIR
+    sudo chown $USER:$USER $API_DIR
+
+    # Copy API server
+    if [ -f "$API_SRC" ]; then
+        cp "$API_SRC" $API_DIR/api_server.py
+    else
+        print_error "API server not found at $API_SRC"
+        exit 1
+    fi
+
+    # Create Python virtual environment for API
+    python3 -m venv $API_DIR/venv
+    source $API_DIR/venv/bin/activate
+
+    # Install API dependencies
+    pip install --quiet flask flask-cors requests
+    print_success "API server dependencies installed"
+
+    # Read client token from agent config if it exists
+    if [ -f /etc/spot-optimizer/agent.env ]; then
+        source /etc/spot-optimizer/agent.env
+    fi
+
+    # Create systemd service for API
+    sudo tee /etc/systemd/system/spot-optimizer-api.service > /dev/null << EOF
 [Unit]
-Description=AWS Spot Optimizer Client Dashboard
+Description=Spot Optimizer API Server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory=$DASHBOARD_DIR
-Environment="FLASK_SECRET_KEY=$(openssl rand -hex 32)"
+WorkingDirectory=$API_DIR
 Environment="BACKEND_URL=$BACKEND_URL"
-ExecStart=$DASHBOARD_DIR/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:3000 app:app
+Environment="CLIENT_TOKEN=${SPOT_OPTIMIZER_CLIENT_TOKEN:-}"
+Environment="PORT=5000"
+ExecStart=$API_DIR/venv/bin/python api_server.py
 Restart=always
 RestartSec=10
-StandardOutput=append:$DASHBOARD_LOG_DIR/dashboard.log
-StandardError=append:$DASHBOARD_LOG_DIR/dashboard-error.log
-
-NoNewPrivileges=true
-PrivateTmp=true
+StandardOutput=append:/var/log/spot-optimizer/api.log
+StandardError=append:/var/log/spot-optimizer/api-error.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable spot-optimizer-dashboard > /dev/null 2>&1
-    print_success "Dashboard systemd service created"
+    sudo systemctl enable spot-optimizer-api > /dev/null 2>&1
+    sudo systemctl start spot-optimizer-api
+    print_success "API server configured and started"
 
     deactivate
 
@@ -420,23 +502,24 @@ EOF
 
     print_header "Step 6: Configuring Nginx (Port 80)"
 
-    # Create nginx configuration
+    # Create nginx configuration for React SPA + API proxy
     sudo tee /etc/nginx/sites-available/spot-optimizer-dashboard > /dev/null << 'EOF'
 server {
     listen 80;
     server_name _;
 
-    # Client Dashboard
-    location / {
-        proxy_pass http://127.0.0.1:3000;
+    # Serve React build
+    root /var/www/spot-optimizer-dashboard/dist;
+    index index.html;
+
+    # API proxy to Flask backend
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
         proxy_connect_timeout 60s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
@@ -447,6 +530,17 @@ server {
         access_log off;
         return 200 'OK';
         add_header Content-Type text/plain;
+    }
+
+    # Serve static files
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # SPA fallback - serve index.html for all routes
+    location / {
+        try_files $uri $uri/ /index.html;
     }
 }
 EOF
@@ -489,11 +583,11 @@ else
     echo -e "Agent Service:     \033[0;31m○ Stopped\033[0m"
 fi
 
-# Dashboard status
-if systemctl is-active --quiet spot-optimizer-dashboard 2>/dev/null; then
-    echo -e "Dashboard Service: \033[0;32m● Running\033[0m"
+# API Server status
+if systemctl is-active --quiet spot-optimizer-api 2>/dev/null; then
+    echo -e "API Service:       \033[0;32m● Running\033[0m"
 else
-    echo -e "Dashboard Service: \033[0;31m○ Stopped\033[0m"
+    echo -e "API Service:       \033[0;31m○ Stopped\033[0m"
 fi
 
 # Nginx status
@@ -522,7 +616,7 @@ sudo tee /usr/local/bin/spot-optimizer-restart > /dev/null << 'EOF'
 #!/bin/bash
 echo "Restarting Spot Optimizer services..."
 sudo systemctl restart spot-optimizer-agent 2>/dev/null || true
-sudo systemctl restart spot-optimizer-dashboard 2>/dev/null || true
+sudo systemctl restart spot-optimizer-api 2>/dev/null || true
 sudo systemctl restart nginx 2>/dev/null || true
 sleep 2
 spot-optimizer-status
@@ -535,7 +629,7 @@ sudo tee /usr/local/bin/spot-optimizer-logs > /dev/null << 'EOF'
 #!/bin/bash
 echo "Tailing all logs (Ctrl+C to stop)..."
 echo "═══════════════════════════════════════════════════════════════"
-tail -f /var/log/spot-optimizer/*.log /var/log/spot-optimizer-dashboard/*.log 2>/dev/null
+tail -f /var/log/spot-optimizer/*.log 2>/dev/null
 EOF
 sudo chmod +x /usr/local/bin/spot-optimizer-logs
 print_success "Created: spot-optimizer-logs"
@@ -547,7 +641,7 @@ print_success "Created: spot-optimizer-logs"
 print_header "Step 8: Configuring Log Rotation"
 
 sudo tee /etc/logrotate.d/spot-optimizer > /dev/null << EOF
-/var/log/spot-optimizer/*.log /var/log/spot-optimizer-dashboard/*.log {
+/var/log/spot-optimizer/*.log {
     daily
     rotate 7
     compress
@@ -558,7 +652,7 @@ sudo tee /etc/logrotate.d/spot-optimizer > /dev/null << EOF
     sharedscripts
     postrotate
         systemctl reload spot-optimizer-agent > /dev/null 2>&1 || true
-        systemctl reload spot-optimizer-dashboard > /dev/null 2>&1 || true
+        systemctl reload spot-optimizer-api > /dev/null 2>&1 || true
     endscript
 }
 EOF
@@ -584,22 +678,20 @@ if [ "$INSTALL_AGENT" = true ]; then
 fi
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
-    print_info "Starting dashboard service..."
-    sudo systemctl start spot-optimizer-dashboard
-    sleep 2
-    if sudo systemctl is-active --quiet spot-optimizer-dashboard; then
-        print_success "Dashboard service started"
-    else
-        print_error "Dashboard service failed to start"
-        print_info "Check logs: tail -50 /var/log/spot-optimizer-dashboard/dashboard.log"
-    fi
-
     print_info "Starting nginx..."
     sudo systemctl restart nginx
     if sudo systemctl is-active --quiet nginx; then
         print_success "Nginx started"
     else
         print_error "Nginx failed to start"
+    fi
+
+    # Verify API server is running
+    if sudo systemctl is-active --quiet spot-optimizer-api; then
+        print_success "API server is running"
+    else
+        print_warning "API server is not running"
+        print_info "Check logs: tail -50 /var/log/spot-optimizer/api.log"
     fi
 fi
 
@@ -625,8 +717,9 @@ fi
 
 if [ "$INSTALL_DASHBOARD" = true ]; then
     print_info "Dashboard Installation:"
-    echo "  • Application: /opt/spot-optimizer-dashboard"
-    echo "  • Logs: /var/log/spot-optimizer-dashboard/"
+    echo "  • Frontend: /var/www/spot-optimizer-dashboard"
+    echo "  • API Server: /opt/spot-optimizer-api"
+    echo "  • Logs: /var/log/spot-optimizer/"
     echo ""
 
     DASHBOARD_URL="http://${PUBLIC_IP:-localhost}"

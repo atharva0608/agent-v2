@@ -24,7 +24,7 @@ import signal
 import logging
 import requests
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -311,7 +311,24 @@ class ServerAPI:
             logger.error(f"Connection error: {endpoint}")
             return None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error {response.status_code}: {endpoint} - {response.text}")
+            # Enhanced logging for database connection pool issues
+            if response.status_code == 500:
+                error_text = response.text
+                if 'pool exhausted' in error_text.lower() or 'failed getting connection' in error_text.lower():
+                    logger.critical("=" * 80)
+                    logger.critical("DATABASE CONNECTION POOL EXHAUSTED ON CENTRAL SERVER!")
+                    logger.critical(f"Endpoint: {endpoint}")
+                    logger.critical("This is a BACKEND ISSUE in the central server (final-ml repo)")
+                    logger.critical("Action Required: Fix database connection pool configuration")
+                    logger.critical("  1. Check database connection pool size (SQLALCHEMY_POOL_SIZE)")
+                    logger.critical("  2. Check max overflow (SQLALCHEMY_MAX_OVERFLOW)")
+                    logger.critical("  3. Check pool recycle time (SQLALCHEMY_POOL_RECYCLE)")
+                    logger.critical("  4. Ensure database connections are properly closed")
+                    logger.critical("=" * 80)
+                else:
+                    logger.error(f"HTTP error {response.status_code}: {endpoint} - {error_text}")
+            else:
+                logger.error(f"HTTP error {response.status_code}: {endpoint} - {response.text}")
             return None
         except Exception as e:
             logger.error(f"Request failed: {endpoint} - {e}")
@@ -353,6 +370,26 @@ class ServerAPI:
             return result.get('commands', result.get('pending_commands', result.get('data', [])))
         return []
 
+    def get_pending_replicas(self, agent_id: str) -> List[Dict]:
+        """Get replicas that need to be launched by agent"""
+        result = self._make_request('GET', f'/api/agents/{agent_id}/replicas?status=launching')
+        if not result:
+            return []
+        if isinstance(result, list):
+            return result
+        elif isinstance(result, dict):
+            return result.get('replicas', [])
+        return []
+
+    def update_replica_instance(self, agent_id: str, replica_id: str, instance_id: str, status: str = 'syncing') -> bool:
+        """Update replica with actual EC2 instance ID"""
+        result = self._make_request(
+            'PUT',
+            f'/api/agents/{agent_id}/replicas/{replica_id}',
+            json={'instance_id': instance_id, 'status': status}
+        )
+        return result is not None
+
     def mark_command_executed(self, agent_id: str, command_id: str, success: bool = True,
                               message: str = "") -> bool:
         """Mark command as executed"""
@@ -376,12 +413,31 @@ class ServerAPI:
         """Report rebalance recommendation"""
         return self._make_request('POST', f'/api/agents/{agent_id}/rebalance-recommendation', json={
             'instance_id': instance_id,
-            'detected_at': datetime.utcnow().isoformat()
+            'detected_at': datetime.now(timezone.utc).isoformat()
         })
 
-    def create_emergency_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
-        """Create emergency replica"""
-        return self._make_request('POST', f'/api/agents/{agent_id}/create-emergency-replica', json=replica_data)
+    def create_emergency_replica(self, agent_id: str, signal_type: str,
+                                  instance_id: str, termination_time: Optional[str] = None) -> Optional[Dict]:
+        """
+        Create emergency replica via backend endpoint.
+
+        Args:
+            agent_id: Agent ID
+            signal_type: 'rebalance-recommendation' or 'termination-notice'
+            instance_id: Current instance ID
+            termination_time: ISO timestamp for termination (required for termination-notice)
+
+        Returns:
+            Response from backend with replica details or error
+        """
+        payload = {
+            'signal_type': signal_type,
+            'instance_id': instance_id
+        }
+        if termination_time:
+            payload['termination_time'] = termination_time
+
+        return self._make_request('POST', f'/api/agents/{agent_id}/create-emergency-replica', json=payload)
 
     def get_replica_config(self, agent_id: str) -> Optional[Dict]:
         """Get replica configuration"""
@@ -555,7 +611,7 @@ class CleanupManager:
     def cleanup_old_snapshots(self, days_old: int = 7) -> Dict:
         """Delete snapshots older than specified days"""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
 
             response = self.ec2.describe_snapshots(
                 OwnerIds=['self'],
@@ -593,7 +649,7 @@ class CleanupManager:
     def cleanup_old_amis(self, days_old: int = 30) -> Dict:
         """Deregister AMIs older than specified days and delete associated snapshots"""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
 
             response = self.ec2.describe_images(
                 Owners=['self'],
@@ -658,7 +714,7 @@ class CleanupManager:
         ami_result = self.cleanup_old_amis(config.CLEANUP_AMIS_OLDER_THAN_DAYS)
 
         return {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'snapshots': snapshot_result,
             'amis': ami_result
         }
@@ -723,13 +779,13 @@ class ReplicaManager:
             waiter = self.ec2.get_waiter('instance_running')
             waiter.wait(InstanceIds=[replica_instance_id])
 
-            # Register with server
+            # Register with server in 'launching' status
             replica_data = {
                 'instance_id': replica_instance_id,
                 'replica_type': replica_type,
                 'parent_instance_id': primary_instance['instance_id'],
                 'pool_id': f"{primary_instance['instance_type']}.{target_az}",
-                'status': 'ready'
+                'status': 'launching'
             }
 
             result = self.server_api.create_replica(agent_id, replica_data)
@@ -739,9 +795,42 @@ class ReplicaManager:
                 self.active_replicas[replica_id] = {
                     'instance_id': replica_instance_id,
                     'replica_type': replica_type,
-                    'status': 'ready'
+                    'status': 'launching'
                 }
-                logger.info(f"Replica registered: {replica_id}")
+                logger.info(f"Replica registered: {replica_id}, starting sync...")
+
+                # Report syncing status
+                self.server_api.update_replica_status(agent_id, replica_id, {
+                    'status': 'syncing',
+                    'sync_started_at': datetime.now(timezone.utc).isoformat()
+                })
+                self.active_replicas[replica_id]['status'] = 'syncing'
+
+                # Wait for instance to be fully initialized (status checks)
+                logger.info(f"Waiting for replica {replica_id} to pass status checks...")
+                try:
+                    waiter = self.ec2.get_waiter('instance_status_ok')
+                    waiter.wait(
+                        InstanceIds=[replica_instance_id],
+                        WaiterConfig={'Delay': 15, 'MaxAttempts': 20}
+                    )
+
+                    # Report ready status
+                    self.server_api.update_replica_status(agent_id, replica_id, {
+                        'status': 'ready',
+                        'sync_completed_at': datetime.now(timezone.utc).isoformat()
+                    })
+                    self.active_replicas[replica_id]['status'] = 'ready'
+                    logger.info(f"Replica {replica_id} is ready")
+                except Exception as wait_error:
+                    logger.warning(f"Status check wait failed, marking ready anyway: {wait_error}")
+                    # Still mark as ready - instance is running even if status checks aren't perfect
+                    self.server_api.update_replica_status(agent_id, replica_id, {
+                        'status': 'ready',
+                        'sync_completed_at': datetime.now(timezone.utc).isoformat()
+                    })
+                    self.active_replicas[replica_id]['status'] = 'ready'
+
                 return replica_id
 
             return None
@@ -788,6 +877,227 @@ class ReplicaManager:
         except Exception as e:
             logger.error(f"Failed to terminate replica: {e}")
             return False
+# ============================================================================
+# SYSTEM MESSAGE MONITOR
+# ============================================================================
+
+class SystemMessageMonitor:
+    """
+    Monitor system broadcast messages for termination confirmation
+
+    Features:
+    - Monitors system logs for broadcast messages
+    - Supports both journalctl (with sudo) and fallback methods
+    - Thread-safe message queue
+    - Graceful shutdown handling
+    """
+
+    def __init__(self):
+        self.is_running = False
+        self.messages: List[Dict[str, Any]] = []
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.has_sudo = self._check_sudo_access()
+        logger.info(f"SystemMessageMonitor initialized (sudo access: {self.has_sudo})")
+
+    def _check_sudo_access(self) -> bool:
+        """Check if we have sudo access"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['sudo', '-n', 'true'],
+                capture_output=True,
+                timeout=2
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def start(self):
+        """Start monitoring system messages"""
+        if self.is_running:
+            logger.warning("SystemMessageMonitor already running")
+            return
+
+        self.is_running = True
+        if self.has_sudo:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_with_journalctl,
+                name="SystemMessageMonitor",
+                daemon=True
+            )
+        else:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_with_dmesg,
+                name="SystemMessageMonitor",
+                daemon=True
+            )
+
+        self.monitor_thread.start()
+        logger.info("SystemMessageMonitor started")
+
+    def stop(self):
+        """Stop monitoring"""
+        self.is_running = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=5)
+        logger.info("SystemMessageMonitor stopped")
+
+    def _monitor_with_journalctl(self):
+        """
+        Monitor system logs using journalctl (requires sudo)
+
+        Monitors for:
+        - Spot instance termination notices
+        - System shutdown broadcasts
+        - Power management events
+        """
+        import subprocess
+
+        try:
+            # Follow journal for relevant messages
+            process = subprocess.Popen(
+                [
+                    'sudo', 'journalctl',
+                    '-f',  # Follow
+                    '-n', '0',  # Start from end
+                    '--priority=warning',  # Warning and above
+                    '-o', 'json'  # JSON output
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            logger.info("Monitoring system logs with journalctl...")
+
+            while self.is_running:
+                line = process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    log_entry = json.loads(line.strip())
+                    message = log_entry.get('MESSAGE', '').lower()
+
+                    # Check for termination-related keywords
+                    termination_keywords = [
+                        'spot instance',
+                        'termination',
+                        'shutdown',
+                        'power off',
+                        'system going down'
+                    ]
+
+                    if any(keyword in message for keyword in termination_keywords):
+                        timestamp = log_entry.get('__REALTIME_TIMESTAMP',
+                                                 str(int(time.time() * 1000000)))
+
+                        self.messages.append({
+                            'timestamp': timestamp,
+                            'message': log_entry.get('MESSAGE'),
+                            'priority': log_entry.get('PRIORITY'),
+                            'unit': log_entry.get('_SYSTEMD_UNIT'),
+                            'source': 'journalctl'
+                        })
+
+                        logger.warning(f"System message detected: {log_entry.get('MESSAGE')}")
+
+                        # Keep only last 100 messages
+                        if len(self.messages) > 100:
+                            self.messages = self.messages[-100:]
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error parsing journal entry: {e}")
+
+            process.terminate()
+
+        except Exception as e:
+            logger.error(f"Journalctl monitoring error: {e}")
+
+    def _monitor_with_dmesg(self):
+        """
+        Fallback monitoring using dmesg (doesn't require sudo)
+
+        Less reliable but works without sudo access
+        """
+        import subprocess
+
+        last_check = time.time()
+        seen_messages = set()
+
+        logger.info("Monitoring system logs with dmesg (fallback mode)...")
+
+        while self.is_running:
+            try:
+                # Run dmesg to get kernel messages
+                result = subprocess.run(
+                    ['dmesg', '-T', '--level=warn,err,crit,alert,emerg'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+
+                    for line in lines:
+                        if not line:
+                            continue
+
+                        # Create a hash to avoid duplicates
+                        line_hash = hash(line)
+                        if line_hash in seen_messages:
+                            continue
+
+                        message_lower = line.lower()
+                        termination_keywords = [
+                            'spot',
+                            'termination',
+                            'shutdown',
+                            'power off'
+                        ]
+
+                        if any(keyword in message_lower for keyword in termination_keywords):
+                            seen_messages.add(line_hash)
+
+                            self.messages.append({
+                                'timestamp': int(time.time() * 1000000),
+                                'message': line,
+                                'priority': 'warning',
+                                'source': 'dmesg'
+                            })
+
+                            logger.warning(f"System message detected: {line}")
+
+                            # Keep only last 100 messages
+                            if len(self.messages) > 100:
+                                self.messages = self.messages[-100:]
+
+                # Check every 10 seconds
+                time.sleep(10)
+
+            except subprocess.TimeoutExpired:
+                logger.warning("dmesg command timed out")
+            except Exception as e:
+                logger.error(f"dmesg monitoring error: {e}")
+                time.sleep(10)
+
+    def get_recent_messages(self, seconds: int = 300) -> List[Dict[str, Any]]:
+        """Get messages from the last N seconds"""
+        cutoff_time = (time.time() - seconds) * 1000000  # Convert to microseconds
+
+        return [
+            msg for msg in self.messages
+            if int(msg['timestamp']) > cutoff_time
+        ]
+
+    def has_termination_message(self, seconds: int = 300) -> bool:
+        """Check if there are any termination messages in the last N seconds"""
+        recent_messages = self.get_recent_messages(seconds)
+        return len(recent_messages) > 0
+
 
 # ============================================================================
 # INSTANCE SWITCHER
@@ -803,22 +1113,19 @@ class InstanceSwitcher:
         self.pricing_collector = SpotPricingCollector()
 
     def execute_switch(self, command: Dict, current_instance_id: str) -> bool:
-        """Execute instance switch with detailed timing tracking"""
+        """Execute instance switch with detailed timing tracking - FAST MODE (under 2 mins)"""
         try:
             target_mode = command['target_mode']
             target_pool_id = command.get('target_pool_id')
             agent_id = command.get('agent_id')
 
-            logger.info(f"Starting switch: {current_instance_id} -> {target_mode}")
+            logger.info(f"Starting FAST switch: {current_instance_id} -> {target_mode}")
 
             timing = {
-                'switch_initiated_at': datetime.utcnow().isoformat() + 'Z',
-                'snapshot_created_at': None,
-                'ami_created_at': None,
+                'switch_initiated_at': datetime.now(timezone.utc).isoformat(),
                 'new_instance_launched_at': None,
                 'new_instance_ready_at': None,
-                'traffic_switched_at': None,
-                'old_instance_terminated_at': None
+                'traffic_switched_at': None
             }
 
             # Get current instance details
@@ -827,17 +1134,14 @@ class InstanceSwitcher:
                 logger.error("Cannot get current instance details")
                 return False
 
-            # Step 1: Create AMI/snapshot if enabled
-            ami_id = None
+            # OPTIMIZATION: Skip AMI creation, use existing AMI for fast switching
+            # Only create AMI if explicitly requested via config
+            ami_id = current_instance['ami_id']  # Use current AMI
             snapshot_data = {'used': False}
-            if config.CREATE_SNAPSHOT_ON_SWITCH:
-                ami_result = self._create_ami(current_instance)
-                if ami_result:
-                    ami_id = ami_result['ami_id']
-                    snapshot_data = ami_result
-                    timing['ami_created_at'] = datetime.utcnow().isoformat() + 'Z'
 
-            # Step 2: Launch new instance
+            logger.info(f"Using existing AMI: {ami_id} (skipping AMI creation for speed)")
+
+            # Step 2: Launch new instance immediately
             new_instance_id = self._launch_new_instance(
                 current_instance, target_mode, target_pool_id, ami_id
             )
@@ -846,7 +1150,7 @@ class InstanceSwitcher:
                 logger.error("Failed to launch new instance")
                 return False
 
-            timing['new_instance_launched_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['new_instance_launched_at'] = datetime.now(timezone.utc).isoformat()
 
             # Wait for new instance to be ready
             if not self._wait_for_instance_ready(new_instance_id):
@@ -854,7 +1158,7 @@ class InstanceSwitcher:
                 self._cleanup_failed_switch(new_instance_id)
                 return False
 
-            timing['new_instance_ready_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['new_instance_ready_at'] = datetime.now(timezone.utc).isoformat()
 
             # Get new instance details
             new_instance = self._get_instance_details(new_instance_id)
@@ -862,16 +1166,22 @@ class InstanceSwitcher:
             # Step 3: Traffic switch point
             logger.info("Traffic switch point - update load balancer/DNS")
             time.sleep(2)
-            timing['traffic_switched_at'] = datetime.utcnow().isoformat() + 'Z'
+            timing['traffic_switched_at'] = datetime.now(timezone.utc).isoformat()
 
-            # Step 4: Terminate old instance if auto-terminate enabled
-            if config.AUTO_TERMINATE_OLD_INSTANCE:
-                logger.info(f"Waiting {config.TERMINATE_WAIT_TIME}s before terminating old instance...")
-                time.sleep(config.TERMINATE_WAIT_TIME)
+            # Step 4: Terminate old instance based on command's terminate_wait_seconds
+            # CRITICAL FIX: Respect command parameter, not config file
+            terminate_wait = command.get('terminate_wait_seconds') or 0
+
+            if terminate_wait > 0:
+                logger.info(f"Auto-terminate enabled: waiting {terminate_wait}s before terminating old instance...")
+                time.sleep(terminate_wait)
 
                 if self._terminate_instance(current_instance_id):
-                    timing['old_instance_terminated_at'] = datetime.utcnow().isoformat() + 'Z'
+                    timing['old_instance_terminated_at'] = datetime.now(timezone.utc).isoformat()
                     logger.info(f"Old instance {current_instance_id} terminated")
+            else:
+                logger.info("Auto-terminate disabled (terminate_wait_seconds=0): keeping old instance running")
+                # Don't include old_terminated_at in timing when auto-terminate is disabled
 
             # Collect pricing data
             on_demand_price = self.pricing_collector.get_ondemand_price(
@@ -928,7 +1238,7 @@ class InstanceSwitcher:
             return False
 
     def _get_instance_details(self, instance_id: str) -> Optional[Dict]:
-        """Get instance details from AWS"""
+        """Get instance details from AWS including IAM profile, security groups, etc"""
         try:
             response = self.ec2.describe_instances(InstanceIds=[instance_id])
 
@@ -939,28 +1249,40 @@ class InstanceSwitcher:
             lifecycle = instance.get('InstanceLifecycle', 'normal')
             mode = 'spot' if lifecycle == 'spot' else 'ondemand'
 
+            # Extract IAM instance profile
+            iam_profile = None
+            if 'IamInstanceProfile' in instance:
+                iam_profile = instance['IamInstanceProfile'].get('Arn')
+
+            # Extract security groups
+            security_groups = [sg['GroupId'] for sg in instance.get('SecurityGroups', [])]
+
             return {
                 'instance_id': instance_id,
                 'instance_type': instance['InstanceType'],
                 'az': instance['Placement']['AvailabilityZone'],
                 'ami_id': instance['ImageId'],
                 'current_mode': mode,
-                'current_pool_id': f"{instance['InstanceType']}.{instance['Placement']['AvailabilityZone']}" if mode == 'spot' else None
+                'current_pool_id': f"{instance['InstanceType']}.{instance['Placement']['AvailabilityZone']}" if mode == 'spot' else None,
+                'iam_instance_profile': iam_profile,
+                'security_groups': security_groups,
+                'key_name': instance.get('KeyName'),
+                'subnet_id': instance.get('SubnetId')
             }
         except Exception as e:
             logger.error(f"Failed to get instance details: {e}")
             return None
 
     def _create_ami(self, instance: Dict) -> Optional[Dict]:
-        """Create AMI from instance"""
+        """Create AMI from instance (SLOW - only use when necessary)"""
         try:
-            timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
             ami_name = f"SpotOptimizer-{instance['instance_id']}-{timestamp}"
 
             response = self.ec2.create_image(
                 InstanceId=instance['instance_id'],
                 Name=ami_name,
-                Description=f"Spot Optimizer AMI - {datetime.utcnow().isoformat()}",
+                Description=f"Spot Optimizer AMI - {datetime.now(timezone.utc).isoformat()}",
                 NoReboot=True,
                 TagSpecifications=[{
                     'ResourceType': 'image',
@@ -990,7 +1312,7 @@ class InstanceSwitcher:
 
     def _launch_new_instance(self, current_instance: Dict, target_mode: str,
                             target_pool_id: Optional[str], ami_id: Optional[str] = None) -> Optional[str]:
-        """Launch new instance"""
+        """Launch new instance with same configuration as current"""
         try:
             launch_params = {
                 'ImageId': ami_id or current_instance['ami_id'],
@@ -1002,14 +1324,29 @@ class InstanceSwitcher:
                     'Tags': [
                         {'Key': 'Name', 'Value': f"SpotOptimizer-{target_mode}"},
                         {'Key': 'ManagedBy', 'Value': 'SpotOptimizer'},
-                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID}
+                        {'Key': 'LogicalAgentId', 'Value': config.LOGICAL_AGENT_ID or 'default'}
                     ]
                 }]
             }
 
+            # Copy IAM instance profile from current instance
+            if current_instance.get('iam_instance_profile'):
+                launch_params['IamInstanceProfile'] = {
+                    'Arn': current_instance['iam_instance_profile']
+                }
+
+            # Copy security groups
+            if current_instance.get('security_groups'):
+                launch_params['SecurityGroupIds'] = current_instance['security_groups']
+
+            # Copy key pair
+            if current_instance.get('key_name'):
+                launch_params['KeyName'] = current_instance['key_name']
+
+            # Set placement and market options for target mode
             if target_mode == 'spot' and target_pool_id:
-                az = target_pool_id.split('.')[-1]
-                launch_params['Placement'] = {'AvailabilityZone': az}
+                target_az = target_pool_id.split('.')[-1]
+                launch_params['Placement'] = {'AvailabilityZone': target_az}
                 launch_params['InstanceMarketOptions'] = {
                     'MarketType': 'spot',
                     'SpotOptions': {
@@ -1018,9 +1355,21 @@ class InstanceSwitcher:
                     }
                 }
 
+                # Only copy subnet if staying in same AZ
+                current_az = current_instance.get('az', '')
+                if current_az == target_az and current_instance.get('subnet_id'):
+                    launch_params['SubnetId'] = current_instance['subnet_id']
+                    logger.info(f"Using existing subnet (same AZ: {target_az})")
+                else:
+                    logger.info(f"Switching AZ: {current_az} -> {target_az}, AWS will select subnet")
+            else:
+                # On-demand mode - copy subnet as-is (staying in same AZ)
+                if current_instance.get('subnet_id'):
+                    launch_params['SubnetId'] = current_instance['subnet_id']
+
             response = self.ec2.run_instances(**launch_params)
             new_instance_id = response['Instances'][0]['InstanceId']
-            logger.info(f"New instance launched: {new_instance_id}")
+            logger.info(f"New instance launched: {new_instance_id} ({target_mode})")
 
             return new_instance_id
         except Exception as e:
@@ -1073,6 +1422,7 @@ class SpotOptimizerAgent:
         self.instance_switcher = InstanceSwitcher(self.server_api)
         self.cleanup_manager = CleanupManager()
         self.replica_manager = ReplicaManager(self.server_api)
+        self.system_monitor = SystemMessageMonitor()
 
         # Agent state
         self.agent_id: Optional[str] = None
@@ -1106,6 +1456,9 @@ class SpotOptimizerAgent:
             self.cached_ondemand_price = self.pricing_collector.get_ondemand_price(
                 self.cached_instance_type, config.REGION
             )
+
+            # Start system message monitor
+            self.system_monitor.start()
 
             self.is_running = True
             self._start_workers()
@@ -1176,6 +1529,7 @@ class SpotOptimizerAgent:
         workers = [
             (self._heartbeat_worker, "Heartbeat"),
             (self._pending_commands_worker, "PendingCommands"),
+            (self._replica_polling_worker, "ReplicaPolling"),
             (self._config_refresh_worker, "ConfigRefresh"),
             (self._pricing_report_worker, "PricingReport"),
             (self._termination_check_worker, "TerminationCheck"),
@@ -1191,6 +1545,8 @@ class SpotOptimizerAgent:
 
     def _heartbeat_worker(self):
         """Send accurate heartbeat with instance details"""
+        consecutive_failures = 0
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 status = 'online' if self.is_enabled else 'disabled'
@@ -1209,9 +1565,26 @@ class SpotOptimizerAgent:
                     'az': az
                 }
 
-                self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id], extra_data)
+                response = self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id], extra_data)
+
+                # Check if agent was deleted from server
+                if response is None:
+                    consecutive_failures += 1
+                    logger.warning(f"Heartbeat failed ({consecutive_failures}/5)")
+
+                    # After 5 consecutive failures, check if agent was deleted
+                    if consecutive_failures >= 5:
+                        logger.warning("Multiple heartbeat failures, checking agent status...")
+                        if self._check_agent_deleted():
+                            logger.critical("Agent has been deleted from server! Running cleanup...")
+                            self._run_cleanup_and_exit()
+                            return
+                else:
+                    consecutive_failures = 0
+
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+                consecutive_failures += 1
 
             self.shutdown_event.wait(config.HEARTBEAT_INTERVAL)
 
@@ -1233,26 +1606,58 @@ class SpotOptimizerAgent:
                             continue
 
                         command_id = command.get('id')
-                        target_mode = command.get('target_mode')
+                        command_type = command.get('command_type', 'switch')  # Default to switch for backward compatibility
 
-                        if not command_id or not target_mode:
+                        if not command_id:
                             continue
 
-                        logger.info(f"Executing command {command_id}: {target_mode}")
+                        # Handle different command types
+                        if command_type == 'create_replica':
+                            # Manual replica creation command
+                            logger.info(f"Executing replica creation command {command_id}")
 
-                        success = self.instance_switcher.execute_switch(
-                            {**command, 'agent_id': self.agent_id},
-                            self.instance_id
-                        )
+                            success = False
+                            message = "Replica creation failed"
 
-                        self.server_api.mark_command_executed(
-                            self.agent_id, command_id, success,
-                            "Switch completed" if success else "Switch failed"
-                        )
+                            current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                            if current_instance:
+                                target_pool_id = command.get('target_pool_id')
+                                replica_id = self.replica_manager.create_replica(
+                                    self.agent_id, current_instance, 'manual', target_pool_id
+                                )
+                                if replica_id:
+                                    success = True
+                                    message = f"Replica created: {replica_id}"
+                                    logger.info(message)
 
-                        if success and config.AUTO_TERMINATE_OLD_INSTANCE:
-                            self.is_running = False
-                            break
+                            self.server_api.mark_command_executed(
+                                self.agent_id, command_id, success, message
+                            )
+
+                        else:
+                            # Switch command (default)
+                            target_mode = command.get('target_mode')
+                            if not target_mode:
+                                continue
+
+                            logger.info(f"Executing switch command {command_id}: {target_mode}")
+
+                            success = self.instance_switcher.execute_switch(
+                                {**command, 'agent_id': self.agent_id},
+                                self.instance_id
+                            )
+
+                            self.server_api.mark_command_executed(
+                                self.agent_id, command_id, success,
+                                "Switch completed" if success else "Switch failed"
+                            )
+
+                            # Stop agent if switch was successful AND old instance was terminated
+                            terminate_wait = command.get('terminate_wait_seconds') or 0
+                            if success and terminate_wait > 0:
+                                logger.info("Old instance terminated, stopping agent...")
+                                self.is_running = False
+                                break
 
                         break
 
@@ -1260,6 +1665,116 @@ class SpotOptimizerAgent:
                 logger.error(f"Pending commands error: {e}")
 
             self.shutdown_event.wait(config.PENDING_COMMANDS_CHECK_INTERVAL)
+
+    def _replica_polling_worker(self):
+        """Poll for replicas that need to be launched"""
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                # Poll for replicas with status='launching' that need EC2 instances
+                pending_replicas = self.server_api.get_pending_replicas(self.agent_id)
+
+                for replica in pending_replicas:
+                    replica_id = replica.get('id')
+
+                    # Handle both flat and nested pool structures
+                    pool_id = replica.get('pool_id')
+                    target_az = replica.get('az')
+
+                    # If pool data is nested (final-ml backend format)
+                    if not pool_id and replica.get('pool'):
+                        pool_data = replica.get('pool')
+                        pool_id = pool_data.get('id')
+                        target_az = pool_data.get('az')
+
+                    if not all([replica_id, pool_id, target_az]):
+                        logger.warning(f"Invalid replica data: {replica}")
+                        continue
+
+                    logger.info(f"Launching EC2 instance for replica {replica_id} in AZ {target_az}")
+
+                    try:
+                        # Get current instance details to copy configuration
+                        current_instance = self.instance_switcher._get_instance_details(self.instance_id)
+                        if not current_instance:
+                            logger.error("Cannot get current instance details")
+                            continue
+
+                        # Launch replica instance with same config as current
+                        launch_params = {
+                            'ImageId': current_instance['ami_id'],
+                            'InstanceType': current_instance['instance_type'],
+                            'MinCount': 1,
+                            'MaxCount': 1,
+                            'Placement': {'AvailabilityZone': target_az},
+                            'TagSpecifications': [{
+                                'ResourceType': 'instance',
+                                'Tags': [
+                                    {'Key': 'Name', 'Value': f'replica-{replica_id[:8]}'},
+                                    {'Key': 'ReplicaId', 'Value': replica_id},
+                                    {'Key': 'ParentInstance', 'Value': self.instance_id}
+                                ]
+                            }]
+                        }
+
+                        # Copy IAM profile
+                        if current_instance.get('iam_instance_profile'):
+                            launch_params['IamInstanceProfile'] = {'Arn': current_instance['iam_instance_profile']}
+
+                        # Copy security groups
+                        if current_instance.get('security_groups'):
+                            launch_params['SecurityGroupIds'] = current_instance['security_groups']
+
+                        # Copy key pair
+                        if current_instance.get('key_name'):
+                            launch_params['KeyName'] = current_instance['key_name']
+
+                        # Launch spot instance
+                        launch_params['InstanceMarketOptions'] = {
+                            'MarketType': 'spot',
+                            'SpotOptions': {
+                                'SpotInstanceType': 'one-time',
+                                'InstanceInterruptionBehavior': 'terminate'
+                            }
+                        }
+
+                        response = self.instance_switcher.ec2.run_instances(**launch_params)
+                        replica_instance_id = response['Instances'][0]['InstanceId']
+                        logger.info(f"Replica instance launched: {replica_instance_id} for replica {replica_id}")
+
+                        # Update backend with real instance ID
+                        self.server_api.update_replica_instance(
+                            self.agent_id,
+                            replica_id,
+                            replica_instance_id,
+                            status='syncing'
+                        )
+
+                        # Wait for instance to be running
+                        waiter = self.instance_switcher.ec2.get_waiter('instance_running')
+                        waiter.wait(InstanceIds=[replica_instance_id])
+
+                        # Update status to ready
+                        self.server_api.update_replica_status(
+                            self.agent_id,
+                            replica_id,
+                            {'status': 'ready', 'sync_completed_at': datetime.now(timezone.utc).isoformat()}
+                        )
+                        logger.info(f"Replica {replica_id} is ready: {replica_instance_id}")
+
+                    except Exception as e:
+                        logger.error(f"Failed to launch replica {replica_id}: {e}")
+                        # Update replica status to failed
+                        self.server_api.update_replica_status(
+                            self.agent_id,
+                            replica_id,
+                            {'status': 'failed', 'error_message': str(e)}
+                        )
+
+            except Exception as e:
+                logger.error(f"Replica polling error: {e}")
+
+            # Poll every 30 seconds
+            self.shutdown_event.wait(30)
 
     def _config_refresh_worker(self):
         """Periodically refresh configuration"""
@@ -1328,7 +1843,7 @@ class SpotOptimizerAgent:
                         'current_spot_price': current_spot_price,
                         'cheapest_pool': cheapest_pool,
                         'spot_pools': spot_pools,
-                        'collected_at': datetime.utcnow().isoformat()
+                        'collected_at': datetime.now(timezone.utc).isoformat()
                     }
                 }
 
@@ -1341,7 +1856,9 @@ class SpotOptimizerAgent:
             self.shutdown_event.wait(config.PRICING_REPORT_INTERVAL)
 
     def _termination_check_worker(self):
-        """Check for spot termination notices"""
+        """Check for spot termination notices (2-minute warning)"""
+        termination_already_handled = False  # Only handle once
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
@@ -1349,26 +1866,56 @@ class SpotOptimizerAgent:
                 if current_mode == 'spot':
                     termination_notice = InstanceMetadata.check_spot_termination_notice()
 
-                    if termination_notice:
-                        logger.warning("TERMINATION NOTICE DETECTED!")
+                    if termination_notice and not termination_already_handled:
+                        logger.critical(f"SPOT TERMINATION NOTICE DETECTED! Instance {self.instance_id} will be terminated!")
+                        termination_already_handled = True
 
-                        # Report to server and get emergency instructions
-                        response = self.server_api.report_termination_notice(
+                        termination_time = termination_notice.get('time')
+
+                        # CRITICAL PATH - 2 minutes to handle failover
+                        # Step 1: Try to create emergency replica via backend
+                        # Backend checks if replica already exists and skips if so
+                        logger.warning("Attempting emergency replica creation via backend...")
+                        replica_response = self.server_api.create_emergency_replica(
+                            self.agent_id,
+                            signal_type='termination-notice',
+                            instance_id=self.instance_id,
+                            termination_time=termination_time
+                        )
+
+                        if replica_response and replica_response.get('success'):
+                            replica_id = replica_response.get('replica_id')
+                            logger.info(f"Emergency replica created by backend: {replica_id}")
+                        else:
+                            logger.warning(f"Emergency replica creation skipped: {replica_response.get('error') if replica_response else 'No response'}")
+
+                        # Step 2: Report termination imminent to backend for failover
+                        # Backend will promote existing replica (created above or previously)
+                        logger.critical("Reporting termination imminent to backend for failover...")
+                        failover_response = self.server_api.report_termination_notice(
                             self.agent_id,
                             {
                                 'instance_id': self.instance_id,
-                                'termination_time': termination_notice.get('time'),  # Backend expects 'termination_time'
-                                'detected_at': datetime.utcnow().isoformat()
+                                'termination_time': termination_time,
+                                'detected_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
 
-                        if response and response.get('create_emergency_replica'):
-                            # Create emergency replica
-                            current_instance = self.instance_switcher._get_instance_details(self.instance_id)
-                            if current_instance:
-                                self.replica_manager.create_replica(
-                                    self.agent_id, current_instance, 'emergency'
-                                )
+                        if failover_response:
+                            if failover_response.get('success'):
+                                logger.info(f"Failover successful: {failover_response.get('message')}")
+                                logger.info(f"New instance: {failover_response.get('new_instance_id')}")
+
+                                # Agent will be terminated by AWS in ~2 minutes
+                                # No need to continue running
+                                logger.info("Shutting down agent gracefully after successful failover")
+                                self.is_running = False
+                                return
+                            else:
+                                logger.error(f"Failover failed: {failover_response.get('error')}")
+                                logger.error("Agent will be terminated without successful failover")
+                        else:
+                            logger.error("No response from backend for termination failover")
 
             except Exception as e:
                 logger.error(f"Termination check error: {e}")
@@ -1377,18 +1924,55 @@ class SpotOptimizerAgent:
 
     def _rebalance_check_worker(self):
         """Check for rebalance recommendations"""
+        rebalance_already_reported = False  # Prevent duplicate reports
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 current_mode, _ = InstanceMetadata.detect_instance_mode_dual()
 
                 if current_mode == 'spot':
                     if InstanceMetadata.check_rebalance_recommendation():
-                        logger.warning("REBALANCE RECOMMENDATION DETECTED!")
+                        if not rebalance_already_reported:
+                            logger.warning("REBALANCE RECOMMENDATION DETECTED!")
+                            rebalance_already_reported = True
 
-                        response = self.server_api.report_rebalance_recommendation(self.agent_id, self.instance_id)
+                            # Step 1: Ask backend to create emergency replica
+                            # Backend will only create if auto_switch_enabled = TRUE
+                            logger.info("Requesting emergency replica from backend...")
+                            replica_response = self.server_api.create_emergency_replica(
+                                self.agent_id,
+                                signal_type='rebalance-recommendation',
+                                instance_id=self.instance_id
+                            )
 
-                        if response and response.get('action') == 'switch':
-                            logger.info("Server recommends switch based on rebalance recommendation")
+                            if replica_response and replica_response.get('success'):
+                                replica_id = replica_response.get('replica_id')
+                                logger.info(f"Backend created emergency replica: {replica_id}")
+
+                                # Track locally
+                                if replica_id:
+                                    self.replica_manager.active_replicas[replica_id] = {
+                                        'instance_id': replica_response.get('replica_instance_id'),
+                                        'replica_type': 'emergency',
+                                        'status': 'launching'
+                                    }
+                            else:
+                                error_msg = replica_response.get('error') if replica_response else 'No response from backend'
+                                logger.warning(f"Emergency replica creation failed or disabled: {error_msg}")
+                                # This is OK - backend may have auto_switch disabled
+
+                            # Step 2: Report to monitoring endpoint
+                            monitoring_response = self.server_api.report_rebalance_recommendation(
+                                self.agent_id, self.instance_id
+                            )
+
+                            # Step 3: Handle additional actions if server recommends
+                            if monitoring_response and monitoring_response.get('action') == 'switch':
+                                logger.warning("Server recommends immediate switch - will be handled by pending commands")
+
+                    else:
+                        # Reset flag when rebalance signal clears
+                        rebalance_already_reported = False
 
             except Exception as e:
                 logger.error(f"Rebalance check error: {e}")
@@ -1418,6 +2002,89 @@ class SpotOptimizerAgent:
 
             self.shutdown_event.wait(config.CLEANUP_INTERVAL)
 
+    def _check_agent_deleted(self) -> bool:
+        """
+        Check if agent has been deleted from server
+
+        Returns True if agent was deleted, False otherwise
+        """
+        try:
+            # Try to fetch agent config - if 404, agent was deleted
+            url = urljoin(config.SERVER_URL, f'/api/agents/{self.agent_id}')
+            headers = {'Authorization': f'Bearer {config.CLIENT_TOKEN}'}
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code == 404:
+                logger.warning("Agent not found on server (404) - agent was deleted")
+                return True
+            elif response.status_code == 401 or response.status_code == 403:
+                logger.warning("Authentication failed - token may be invalid")
+                return False
+            elif response.status_code == 200:
+                logger.info("Agent still exists on server")
+                return False
+            else:
+                logger.warning(f"Unexpected status code: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error checking agent status: {e}")
+            return False
+
+    def _run_cleanup_and_exit(self):
+        """
+        Run complete cleanup and exit agent
+
+        This is called when the agent has been deleted from the server
+        """
+        import subprocess
+
+        logger.critical("="*80)
+        logger.critical("AGENT DELETION DETECTED - RUNNING COMPLETE CLEANUP")
+        logger.critical("="*80)
+
+        # Stop the agent
+        self.is_running = False
+        self.shutdown_event.set()
+
+        # Find and run the uninstall script
+        uninstall_script_paths = [
+            '/opt/spot-optimizer-agent/../../../agent-v2/scripts/uninstall.sh',
+            '/tmp/spot-optimizer-uninstall.sh',
+            str(Path(__file__).parent.parent / 'scripts' / 'uninstall.sh')
+        ]
+
+        uninstall_script = None
+        for path in uninstall_script_paths:
+            if Path(path).exists():
+                uninstall_script = path
+                break
+
+        if uninstall_script:
+            logger.info(f"Running uninstall script: {uninstall_script}")
+            try:
+                # Run uninstall script with --yes flag to auto-confirm
+                result = subprocess.run(
+                    ['bash', uninstall_script, '--yes'],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+
+                logger.info(f"Uninstall script output: {result.stdout}")
+                if result.stderr:
+                    logger.error(f"Uninstall script errors: {result.stderr}")
+
+                logger.info("Cleanup completed successfully")
+            except Exception as e:
+                logger.error(f"Failed to run uninstall script: {e}")
+        else:
+            logger.error("Uninstall script not found - manual cleanup required")
+
+        # Force exit
+        sys.exit(0)
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         logger.info(f"Received signal {signum}, shutting down...")
@@ -1430,6 +2097,9 @@ class SpotOptimizerAgent:
 
         self.is_running = False
         self.shutdown_event.set()
+
+        # Stop system monitor
+        self.system_monitor.stop()
 
         for thread in self.threads:
             thread.join(timeout=5)

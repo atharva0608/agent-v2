@@ -91,7 +91,7 @@ def logout():
 @login_required
 def dashboard():
     """Main dashboard"""
-    return render_template('dashboard.html', client_name=session.get('client_name', 'Client'))
+    return render_template('dashboard_modern.html', client_name=session.get('client_name', 'Client'))
 
 @app.route('/agents')
 @login_required
@@ -217,7 +217,7 @@ def api_instance_pricing(instance_id):
 def api_switches():
     """Get switch history"""
     client_id = session.get('client_id')
-    response = api_request('GET', f'/api/client/{client_id}/switches')
+    response = api_request('GET', f'/api/client/{client_id}/switch-history')
 
     if response and response.status_code == 200:
         return jsonify(response.json())

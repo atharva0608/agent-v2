@@ -56,15 +56,21 @@
                         </td>
                         <td class="px-6 py-4 text-sm text-gray-500" x-text="formatDate(agent.last_heartbeat_at)"></td>
                         <td class="px-6 py-4">
-                            <div class="flex space-x-2">
+                            <div class="flex flex-wrap gap-2">
                                 <button @click="toggleAgent(agent)"
                                         class="px-3 py-1 text-sm rounded"
                                         :class="agent.enabled ? 'bg-red-100 text-red-700 hover:bg-red-200' : 'bg-green-100 text-green-700 hover:bg-green-200'"
                                         x-text="agent.enabled ? 'Disable' : 'Enable'">
                                 </button>
                                 <button @click="openSwitchModal(agent)"
-                                        class="px-3 py-1 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200">
+                                        :disabled="agent.status !== 'online'"
+                                        class="px-3 py-1 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200 disabled:opacity-50 disabled:cursor-not-allowed">
                                     Switch
+                                </button>
+                                <button @click="openReplicaModal(agent)"
+                                        :disabled="agent.status !== 'online'"
+                                        class="px-3 py-1 text-sm bg-purple-100 text-purple-700 rounded hover:bg-purple-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    Replica
                                 </button>
                                 <button @click="openSettingsModal(agent)"
                                         class="px-3 py-1 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200">
@@ -148,6 +154,29 @@
             </div>
         </div>
     </div>
+
+    <!-- Replica Modal -->
+    <div x-show="showReplicaModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" x-cloak>
+        <div class="bg-white rounded-xl p-6 w-full max-w-md">
+            <h3 class="text-lg font-semibold mb-4">Create Replica</h3>
+            <div class="space-y-4">
+                <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm text-blue-800">
+                    Creating a replica for <strong x-text="selectedAgent?.hostname || selectedAgent?.instance_id"></strong>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Target Pool (AZ)</label>
+                    <input type="text" x-model="replicaForm.target_pool_id"
+                           placeholder="e.g., t3.medium.ap-south-1b"
+                           class="w-full px-3 py-2 border rounded-lg">
+                    <p class="text-xs text-gray-500 mt-1">Leave empty for automatic selection</p>
+                </div>
+            </div>
+            <div class="flex justify-end space-x-3 mt-6">
+                <button @click="showReplicaModal = false" class="px-4 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                <button @click="createReplica()" class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700">Create Replica</button>
+            </div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -158,10 +187,12 @@ function agentsData() {
         agents: [],
         showSwitchModal: false,
         showSettingsModal: false,
+        showReplicaModal: false,
         selectedAgent: null,
         availablePools: [],
         switchForm: { target_mode: 'spot', target_pool_id: '' },
         settingsForm: { auto_switch_enabled: false, auto_terminate_enabled: true, manual_replica_enabled: false, replica_count: 1 },
+        replicaForm: { target_pool_id: '' },
 
         async fetchAgents() {
             try {
@@ -222,8 +253,38 @@ function agentsData() {
                 });
                 this.showSettingsModal = false;
                 this.fetchAgents();
+                alert('Settings saved successfully');
             } catch (error) {
                 console.error('Failed to save settings:', error);
+                alert('Failed to save settings');
+            }
+        },
+
+        openReplicaModal(agent) {
+            this.selectedAgent = agent;
+            this.replicaForm = { target_pool_id: '' };
+            this.showReplicaModal = true;
+        },
+
+        async createReplica() {
+            try {
+                const response = await fetch(`/api/agents/${this.selectedAgent.id}/replicas`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(this.replicaForm)
+                });
+
+                if (response.ok) {
+                    this.showReplicaModal = false;
+                    this.fetchAgents();
+                    alert('Replica creation initiated');
+                } else {
+                    const error = await response.json();
+                    alert('Failed to create replica: ' + (error.error || 'Unknown error'));
+                }
+            } catch (error) {
+                console.error('Failed to create replica:', error);
+                alert('Failed to create replica');
             }
         },
 
