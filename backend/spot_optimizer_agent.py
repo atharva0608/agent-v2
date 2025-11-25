@@ -1169,18 +1169,34 @@ class InstanceSwitcher:
             timing['traffic_switched_at'] = datetime.now(timezone.utc).isoformat()
 
             # Step 4: Terminate old instance based on command's terminate_wait_seconds
-            # CRITICAL FIX: Respect command parameter, not config file
+            # CRITICAL: This respects the backend's auto_terminate_enabled setting
+            # Backend sets terminate_wait_seconds based on agent's auto_terminate_enabled config
             terminate_wait = command.get('terminate_wait_seconds') or 0
 
+            logger.warning("")
+            logger.warning("=" * 70)
+            logger.warning("🔧 AUTO-TERMINATE DECISION:")
+            logger.warning(f"   terminate_wait_seconds: {terminate_wait}")
+            logger.warning(f"   Backend auto_terminate_enabled: {'TRUE' if terminate_wait > 0 else 'FALSE'}")
+            logger.warning("=" * 70)
+
             if terminate_wait > 0:
-                logger.info(f"Auto-terminate enabled: waiting {terminate_wait}s before terminating old instance...")
+                logger.warning(f"⏳ Auto-terminate ENABLED: waiting {terminate_wait}s before terminating old instance...")
+                logger.info(f"→ Old instance {current_instance_id} will be terminated after wait period")
                 time.sleep(terminate_wait)
 
+                logger.warning(f"→ Wait period complete, terminating old instance {current_instance_id}...")
                 if self._terminate_instance(current_instance_id):
                     timing['old_instance_terminated_at'] = datetime.now(timezone.utc).isoformat()
-                    logger.info(f"Old instance {current_instance_id} terminated")
+                    logger.warning(f"✅ Old instance {current_instance_id} successfully terminated")
+                    logger.warning(f"   Backend will mark instance as 'terminated' in database")
+                else:
+                    logger.error(f"✗ Failed to terminate old instance {current_instance_id}")
             else:
-                logger.info("Auto-terminate disabled (terminate_wait_seconds=0): keeping old instance running")
+                logger.warning("🛡️  Auto-terminate DISABLED (terminate_wait_seconds=0)")
+                logger.warning(f"   Old instance {current_instance_id} will REMAIN RUNNING")
+                logger.warning(f"   Backend will mark instance as 'zombie' in database")
+                logger.warning(f"   Instance status: running but not primary")
                 # Don't include old_terminated_at in timing when auto-terminate is disabled
 
             # Collect pricing data
@@ -1638,10 +1654,21 @@ class SpotOptimizerAgent:
                         else:
                             # Switch command (default)
                             target_mode = command.get('target_mode')
+                            target_pool_id = command.get('target_pool_id', 'N/A')
+                            terminate_wait = command.get('terminate_wait_seconds', 0)
+
                             if not target_mode:
                                 continue
 
-                            logger.info(f"Executing switch command {command_id}: {target_mode}")
+                            # Log switch command details with auto-terminate info
+                            logger.warning("=" * 70)
+                            logger.warning(f"🔄 SWITCH COMMAND RECEIVED")
+                            logger.warning(f"   Command ID: {command_id}")
+                            logger.warning(f"   Target Mode: {target_mode}")
+                            logger.warning(f"   Target Pool: {target_pool_id}")
+                            logger.warning(f"   Terminate Wait: {terminate_wait}s")
+                            logger.warning(f"   Auto-Terminate: {'ENABLED' if terminate_wait > 0 else 'DISABLED'}")
+                            logger.warning("=" * 70)
 
                             success = self.instance_switcher.execute_switch(
                                 {**command, 'agent_id': self.agent_id},
@@ -1654,11 +1681,19 @@ class SpotOptimizerAgent:
                             )
 
                             # Stop agent if switch was successful AND old instance was terminated
-                            terminate_wait = command.get('terminate_wait_seconds') or 0
                             if success and terminate_wait > 0:
-                                logger.info("Old instance terminated, stopping agent...")
+                                logger.warning("=" * 70)
+                                logger.warning("🛑 OLD INSTANCE TERMINATED - STOPPING AGENT")
+                                logger.warning(f"   Terminate wait was: {terminate_wait}s")
+                                logger.warning("=" * 70)
                                 self.is_running = False
                                 break
+                            elif success and terminate_wait == 0:
+                                logger.warning("=" * 70)
+                                logger.warning("✓ SWITCH COMPLETED - OLD INSTANCE KEPT RUNNING")
+                                logger.warning("   Auto-terminate is DISABLED (terminate_wait=0)")
+                                logger.warning("   Old instance marked as 'zombie' in backend")
+                                logger.warning("=" * 70)
 
                         break
 
@@ -1778,13 +1813,28 @@ class SpotOptimizerAgent:
             self.shutdown_event.wait(30)
 
     def _replica_termination_worker(self):
-        """Poll for replicas that need to be terminated and terminate their EC2 instances"""
+        """
+        Poll for replicas marked for termination by the central backend and terminate their EC2 instances.
+
+        Backend Flow (when manual_replica_enabled toggle is turned OFF):
+        1. Backend marks replicas: status='terminated', is_active=FALSE
+        2. Agent polls: GET /api/agents/{id}/replicas?status=terminated
+        3. Agent terminates actual EC2 instances via AWS API
+        4. Agent confirms termination back to backend
+
+        This ensures replicas are actually deleted when toggled off in the UI.
+        """
         terminated_replica_ids = set()  # Track replicas we've already terminated
         last_logged_count = -1  # Track last count to avoid spam
+        logger.info("╔══════════════════════════════════════════════════════════════╗")
+        logger.info("║  Replica Termination Worker Started                         ║")
+        logger.info("║  Polling every 30s for replicas marked 'terminated'        ║")
+        logger.info("╚══════════════════════════════════════════════════════════════╝")
 
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 # Get replicas marked as 'terminated' in database
+                # This endpoint is called when central backend marks replicas for deletion
                 result = self.server_api._make_request(
                     'GET',
                     f'/api/agents/{self.agent_id}/replicas?status=terminated'
@@ -1799,10 +1849,12 @@ class SpotOptimizerAgent:
 
                 # Log when we find replicas to terminate (avoid spam by checking count change)
                 if len(terminated_replicas) > 0 and len(terminated_replicas) != last_logged_count:
-                    logger.info(f"Found {len(terminated_replicas)} replica(s) marked for termination")
+                    logger.warning("=" * 70)
+                    logger.warning(f"🔴 REPLICA TERMINATION: Found {len(terminated_replicas)} replica(s) marked for termination by backend")
+                    logger.warning("=" * 70)
                     last_logged_count = len(terminated_replicas)
                 elif len(terminated_replicas) == 0 and last_logged_count != 0:
-                    logger.debug("No replicas pending termination")
+                    logger.info("✓ All replicas terminated successfully")
                     last_logged_count = 0
 
                 for replica in terminated_replicas:
@@ -1810,13 +1862,15 @@ class SpotOptimizerAgent:
                     instance_id = replica.get('instance_id')
                     is_active = replica.get('is_active', False)
                     replica_status = replica.get('status', 'unknown')
+                    replica_type = replica.get('type', 'unknown')
 
                     if not all([replica_id, instance_id]):
-                        logger.warning(f"Skipping replica with missing data: replica_id={replica_id}, instance_id={instance_id}")
+                        logger.warning(f"⚠️  Skipping replica with missing data: replica_id={replica_id}, instance_id={instance_id}")
                         continue
 
                     # Skip if we've already terminated this replica in this session
                     if replica_id in terminated_replica_ids:
+                        logger.debug(f"Skipping already-terminated replica {replica_id}")
                         continue
 
                     # Skip placeholder instance IDs (not real EC2 instances)
@@ -1826,16 +1880,25 @@ class SpotOptimizerAgent:
                         continue
 
                     # Log detailed info about replica we're about to terminate
-                    logger.warning(f"REPLICA TERMINATION TRIGGERED: replica_id={replica_id}, instance_id={instance_id}, status={replica_status}, is_active={is_active}")
-                    logger.info(f"Terminating EC2 instance {instance_id} for replica {replica_id}")
+                    logger.warning("")
+                    logger.warning(f"🔧 TERMINATING REPLICA:")
+                    logger.warning(f"   Replica ID: {replica_id}")
+                    logger.warning(f"   Instance ID: {instance_id}")
+                    logger.warning(f"   Type: {replica_type}")
+                    logger.warning(f"   Status: {replica_status}")
+                    logger.warning(f"   Is Active: {is_active}")
+                    logger.warning("")
                     terminated_replica_ids.add(replica_id)
 
                     try:
                         # Check if instance exists before trying to terminate
                         try:
+                            logger.info(f"→ Checking if instance {instance_id} exists in AWS...")
                             instance_check = self.instance_switcher.ec2.describe_instances(InstanceIds=[instance_id])
+
                             if not instance_check['Reservations']:
-                                logger.warning(f"Instance {instance_id} not found in AWS, marking replica as terminated in database")
+                                logger.warning(f"⚠️  Instance {instance_id} not found in AWS (already deleted)")
+                                logger.info(f"→ Updating database to mark replica {replica_id} as terminated...")
                                 # Instance doesn't exist, just update database
                                 self.server_api.update_replica_status(
                                     self.agent_id,
@@ -1846,12 +1909,15 @@ class SpotOptimizerAgent:
                                         'terminated_at': datetime.now(timezone.utc).isoformat()
                                     }
                                 )
+                                logger.info(f"✓ Database updated for non-existent instance")
                                 continue
 
                             # Check current instance state
                             instance_state = instance_check['Reservations'][0]['Instances'][0]['State']['Name']
+                            logger.info(f"→ Instance {instance_id} current state: {instance_state}")
+
                             if instance_state in ['terminated', 'terminating']:
-                                logger.info(f"Instance {instance_id} already {instance_state}, updating database")
+                                logger.info(f"✓ Instance {instance_id} already {instance_state}, updating database")
                                 self.server_api.update_replica_status(
                                     self.agent_id,
                                     replica_id,
@@ -1861,18 +1927,39 @@ class SpotOptimizerAgent:
                                         'terminated_at': datetime.now(timezone.utc).isoformat()
                                     }
                                 )
+                                logger.info(f"✓ Database updated for already-terminated instance")
                                 continue
 
+                        except ClientError as check_error:
+                            error_code = check_error.response.get('Error', {}).get('Code', '')
+                            if error_code == 'InvalidInstanceID.NotFound':
+                                logger.warning(f"⚠️  Instance {instance_id} not found in AWS (InvalidInstanceID)")
+                                # Update database anyway
+                                self.server_api.update_replica_status(
+                                    self.agent_id,
+                                    replica_id,
+                                    {
+                                        'status': 'terminated',
+                                        'is_active': False,
+                                        'terminated_at': datetime.now(timezone.utc).isoformat()
+                                    }
+                                )
+                                logger.info(f"✓ Database updated for non-existent instance")
+                                continue
+                            else:
+                                logger.error(f"✗ AWS API error while checking instance {instance_id}: {check_error}")
+                                # Continue with termination attempt anyway
                         except Exception as check_error:
-                            logger.error(f"Failed to check instance {instance_id} status: {check_error}")
+                            logger.error(f"✗ Unexpected error while checking instance {instance_id}: {check_error}")
                             # Continue with termination attempt anyway
 
                         # Terminate the EC2 instance
-                        logger.info(f"Calling EC2 terminate_instances for {instance_id}")
+                        logger.info(f"→ Calling AWS EC2 API: terminate_instances({instance_id})...")
                         self.instance_switcher.ec2.terminate_instances(InstanceIds=[instance_id])
-                        logger.info(f"✓ Successfully terminated EC2 instance {instance_id} for replica {replica_id}")
+                        logger.info(f"✅ Successfully terminated EC2 instance {instance_id}")
 
                         # Update replica status to confirm termination
+                        logger.info(f"→ Updating backend database for replica {replica_id}...")
                         self.server_api.update_replica_status(
                             self.agent_id,
                             replica_id,
@@ -1882,11 +1969,30 @@ class SpotOptimizerAgent:
                                 'terminated_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
-                        logger.info(f"✓ Database updated for replica {replica_id}")
+                        logger.info(f"✅ Backend database updated successfully")
+                        logger.warning("")
+                        logger.warning(f"✅✅✅ REPLICA {replica_id} FULLY TERMINATED ✅✅✅")
+                        logger.warning("")
 
+                    except ClientError as e:
+                        error_code = e.response.get('Error', {}).get('Code', '')
+                        error_msg = e.response.get('Error', {}).get('Message', str(e))
+                        logger.error(f"")
+                        logger.error(f"✗✗✗ AWS API ERROR during termination ✗✗✗")
+                        logger.error(f"✗ Instance: {instance_id}")
+                        logger.error(f"✗ Replica: {replica_id}")
+                        logger.error(f"✗ Error Code: {error_code}")
+                        logger.error(f"✗ Error Message: {error_msg}")
+                        logger.error(f"")
+                        # Don't retry immediately - will try again on next poll (30s)
                     except Exception as e:
-                        logger.error(f"✗ Failed to terminate EC2 instance {instance_id} for replica {replica_id}: {e}")
-                        # Don't retry immediately - will try again on next poll
+                        logger.error(f"")
+                        logger.error(f"✗✗✗ UNEXPECTED ERROR during termination ✗✗✗")
+                        logger.error(f"✗ Instance: {instance_id}")
+                        logger.error(f"✗ Replica: {replica_id}")
+                        logger.error(f"✗ Error: {e}")
+                        logger.error(f"")
+                        # Don't retry immediately - will try again on next poll (30s)
 
             except Exception as e:
                 logger.error(f"Replica termination polling error: {e}")
