@@ -877,6 +877,227 @@ class ReplicaManager:
         except Exception as e:
             logger.error(f"Failed to terminate replica: {e}")
             return False
+# ============================================================================
+# SYSTEM MESSAGE MONITOR
+# ============================================================================
+
+class SystemMessageMonitor:
+    """
+    Monitor system broadcast messages for termination confirmation
+
+    Features:
+    - Monitors system logs for broadcast messages
+    - Supports both journalctl (with sudo) and fallback methods
+    - Thread-safe message queue
+    - Graceful shutdown handling
+    """
+
+    def __init__(self):
+        self.is_running = False
+        self.messages: List[Dict[str, Any]] = []
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.has_sudo = self._check_sudo_access()
+        logger.info(f"SystemMessageMonitor initialized (sudo access: {self.has_sudo})")
+
+    def _check_sudo_access(self) -> bool:
+        """Check if we have sudo access"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['sudo', '-n', 'true'],
+                capture_output=True,
+                timeout=2
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def start(self):
+        """Start monitoring system messages"""
+        if self.is_running:
+            logger.warning("SystemMessageMonitor already running")
+            return
+
+        self.is_running = True
+        if self.has_sudo:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_with_journalctl,
+                name="SystemMessageMonitor",
+                daemon=True
+            )
+        else:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_with_dmesg,
+                name="SystemMessageMonitor",
+                daemon=True
+            )
+
+        self.monitor_thread.start()
+        logger.info("SystemMessageMonitor started")
+
+    def stop(self):
+        """Stop monitoring"""
+        self.is_running = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=5)
+        logger.info("SystemMessageMonitor stopped")
+
+    def _monitor_with_journalctl(self):
+        """
+        Monitor system logs using journalctl (requires sudo)
+
+        Monitors for:
+        - Spot instance termination notices
+        - System shutdown broadcasts
+        - Power management events
+        """
+        import subprocess
+
+        try:
+            # Follow journal for relevant messages
+            process = subprocess.Popen(
+                [
+                    'sudo', 'journalctl',
+                    '-f',  # Follow
+                    '-n', '0',  # Start from end
+                    '--priority=warning',  # Warning and above
+                    '-o', 'json'  # JSON output
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            logger.info("Monitoring system logs with journalctl...")
+
+            while self.is_running:
+                line = process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    log_entry = json.loads(line.strip())
+                    message = log_entry.get('MESSAGE', '').lower()
+
+                    # Check for termination-related keywords
+                    termination_keywords = [
+                        'spot instance',
+                        'termination',
+                        'shutdown',
+                        'power off',
+                        'system going down'
+                    ]
+
+                    if any(keyword in message for keyword in termination_keywords):
+                        timestamp = log_entry.get('__REALTIME_TIMESTAMP',
+                                                 str(int(time.time() * 1000000)))
+
+                        self.messages.append({
+                            'timestamp': timestamp,
+                            'message': log_entry.get('MESSAGE'),
+                            'priority': log_entry.get('PRIORITY'),
+                            'unit': log_entry.get('_SYSTEMD_UNIT'),
+                            'source': 'journalctl'
+                        })
+
+                        logger.warning(f"System message detected: {log_entry.get('MESSAGE')}")
+
+                        # Keep only last 100 messages
+                        if len(self.messages) > 100:
+                            self.messages = self.messages[-100:]
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error parsing journal entry: {e}")
+
+            process.terminate()
+
+        except Exception as e:
+            logger.error(f"Journalctl monitoring error: {e}")
+
+    def _monitor_with_dmesg(self):
+        """
+        Fallback monitoring using dmesg (doesn't require sudo)
+
+        Less reliable but works without sudo access
+        """
+        import subprocess
+
+        last_check = time.time()
+        seen_messages = set()
+
+        logger.info("Monitoring system logs with dmesg (fallback mode)...")
+
+        while self.is_running:
+            try:
+                # Run dmesg to get kernel messages
+                result = subprocess.run(
+                    ['dmesg', '-T', '--level=warn,err,crit,alert,emerg'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+
+                    for line in lines:
+                        if not line:
+                            continue
+
+                        # Create a hash to avoid duplicates
+                        line_hash = hash(line)
+                        if line_hash in seen_messages:
+                            continue
+
+                        message_lower = line.lower()
+                        termination_keywords = [
+                            'spot',
+                            'termination',
+                            'shutdown',
+                            'power off'
+                        ]
+
+                        if any(keyword in message_lower for keyword in termination_keywords):
+                            seen_messages.add(line_hash)
+
+                            self.messages.append({
+                                'timestamp': int(time.time() * 1000000),
+                                'message': line,
+                                'priority': 'warning',
+                                'source': 'dmesg'
+                            })
+
+                            logger.warning(f"System message detected: {line}")
+
+                            # Keep only last 100 messages
+                            if len(self.messages) > 100:
+                                self.messages = self.messages[-100:]
+
+                # Check every 10 seconds
+                time.sleep(10)
+
+            except subprocess.TimeoutExpired:
+                logger.warning("dmesg command timed out")
+            except Exception as e:
+                logger.error(f"dmesg monitoring error: {e}")
+                time.sleep(10)
+
+    def get_recent_messages(self, seconds: int = 300) -> List[Dict[str, Any]]:
+        """Get messages from the last N seconds"""
+        cutoff_time = (time.time() - seconds) * 1000000  # Convert to microseconds
+
+        return [
+            msg for msg in self.messages
+            if int(msg['timestamp']) > cutoff_time
+        ]
+
+    def has_termination_message(self, seconds: int = 300) -> bool:
+        """Check if there are any termination messages in the last N seconds"""
+        recent_messages = self.get_recent_messages(seconds)
+        return len(recent_messages) > 0
+
 
 # ============================================================================
 # INSTANCE SWITCHER
@@ -1201,6 +1422,7 @@ class SpotOptimizerAgent:
         self.instance_switcher = InstanceSwitcher(self.server_api)
         self.cleanup_manager = CleanupManager()
         self.replica_manager = ReplicaManager(self.server_api)
+        self.system_monitor = SystemMessageMonitor()
 
         # Agent state
         self.agent_id: Optional[str] = None
@@ -1234,6 +1456,9 @@ class SpotOptimizerAgent:
             self.cached_ondemand_price = self.pricing_collector.get_ondemand_price(
                 self.cached_instance_type, config.REGION
             )
+
+            # Start system message monitor
+            self.system_monitor.start()
 
             self.is_running = True
             self._start_workers()
@@ -1320,6 +1545,8 @@ class SpotOptimizerAgent:
 
     def _heartbeat_worker(self):
         """Send accurate heartbeat with instance details"""
+        consecutive_failures = 0
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 status = 'online' if self.is_enabled else 'disabled'
@@ -1338,9 +1565,26 @@ class SpotOptimizerAgent:
                     'az': az
                 }
 
-                self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id], extra_data)
+                response = self.server_api.send_heartbeat(self.agent_id, status, [self.instance_id], extra_data)
+
+                # Check if agent was deleted from server
+                if response is None:
+                    consecutive_failures += 1
+                    logger.warning(f"Heartbeat failed ({consecutive_failures}/5)")
+
+                    # After 5 consecutive failures, check if agent was deleted
+                    if consecutive_failures >= 5:
+                        logger.warning("Multiple heartbeat failures, checking agent status...")
+                        if self._check_agent_deleted():
+                            logger.critical("Agent has been deleted from server! Running cleanup...")
+                            self._run_cleanup_and_exit()
+                            return
+                else:
+                    consecutive_failures = 0
+
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+                consecutive_failures += 1
 
             self.shutdown_event.wait(config.HEARTBEAT_INTERVAL)
 
@@ -1758,6 +2002,89 @@ class SpotOptimizerAgent:
 
             self.shutdown_event.wait(config.CLEANUP_INTERVAL)
 
+    def _check_agent_deleted(self) -> bool:
+        """
+        Check if agent has been deleted from server
+
+        Returns True if agent was deleted, False otherwise
+        """
+        try:
+            # Try to fetch agent config - if 404, agent was deleted
+            url = urljoin(config.SERVER_URL, f'/api/agents/{self.agent_id}')
+            headers = {'Authorization': f'Bearer {config.CLIENT_TOKEN}'}
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code == 404:
+                logger.warning("Agent not found on server (404) - agent was deleted")
+                return True
+            elif response.status_code == 401 or response.status_code == 403:
+                logger.warning("Authentication failed - token may be invalid")
+                return False
+            elif response.status_code == 200:
+                logger.info("Agent still exists on server")
+                return False
+            else:
+                logger.warning(f"Unexpected status code: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error checking agent status: {e}")
+            return False
+
+    def _run_cleanup_and_exit(self):
+        """
+        Run complete cleanup and exit agent
+
+        This is called when the agent has been deleted from the server
+        """
+        import subprocess
+
+        logger.critical("="*80)
+        logger.critical("AGENT DELETION DETECTED - RUNNING COMPLETE CLEANUP")
+        logger.critical("="*80)
+
+        # Stop the agent
+        self.is_running = False
+        self.shutdown_event.set()
+
+        # Find and run the uninstall script
+        uninstall_script_paths = [
+            '/opt/spot-optimizer-agent/../../../agent-v2/scripts/uninstall.sh',
+            '/tmp/spot-optimizer-uninstall.sh',
+            str(Path(__file__).parent.parent / 'scripts' / 'uninstall.sh')
+        ]
+
+        uninstall_script = None
+        for path in uninstall_script_paths:
+            if Path(path).exists():
+                uninstall_script = path
+                break
+
+        if uninstall_script:
+            logger.info(f"Running uninstall script: {uninstall_script}")
+            try:
+                # Run uninstall script with --yes flag to auto-confirm
+                result = subprocess.run(
+                    ['bash', uninstall_script, '--yes'],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+
+                logger.info(f"Uninstall script output: {result.stdout}")
+                if result.stderr:
+                    logger.error(f"Uninstall script errors: {result.stderr}")
+
+                logger.info("Cleanup completed successfully")
+            except Exception as e:
+                logger.error(f"Failed to run uninstall script: {e}")
+        else:
+            logger.error("Uninstall script not found - manual cleanup required")
+
+        # Force exit
+        sys.exit(0)
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         logger.info(f"Received signal {signum}, shutting down...")
@@ -1770,6 +2097,9 @@ class SpotOptimizerAgent:
 
         self.is_running = False
         self.shutdown_event.set()
+
+        # Stop system monitor
+        self.system_monitor.stop()
 
         for thread in self.threads:
             thread.join(timeout=5)

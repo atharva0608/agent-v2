@@ -92,26 +92,62 @@ else
 fi
 
 # ==============================================================================
+# INSTANCE MEMORY - Check for previous installation
+# ==============================================================================
+
+INSTANCE_MEMORY_DIR="/var/lib/spot-optimizer"
+INSTANCE_MEMORY_FILE="$INSTANCE_MEMORY_DIR/instance-config.env"
+
+# Check if previous configuration exists
+REUSE_CONFIG=false
+if [ -f "$INSTANCE_MEMORY_FILE" ]; then
+    print_info "Previous installation detected!"
+    echo ""
+    cat "$INSTANCE_MEMORY_FILE" | grep -v "^#" | grep "=" || true
+    echo ""
+    read -p "Would you like to reuse the previous configuration? (y/n): " REUSE_ANSWER
+
+    if [[ "$REUSE_ANSWER" =~ ^[Yy]$ ]]; then
+        REUSE_CONFIG=true
+        print_success "Loading previous configuration..."
+        source "$INSTANCE_MEMORY_FILE"
+
+        # Override with saved values
+        INSTALL_AGENT=${SAVED_INSTALL_AGENT:-false}
+        INSTALL_DASHBOARD=${SAVED_INSTALL_DASHBOARD:-false}
+        SERVER_URL=${SAVED_SERVER_URL:-}
+        CLIENT_TOKEN=${SAVED_CLIENT_TOKEN:-}
+        AWS_REGION=${SAVED_AWS_REGION:-ap-south-1}
+        LOGICAL_AGENT_ID=${SAVED_LOGICAL_AGENT_ID:-}
+        BACKEND_URL=${SAVED_BACKEND_URL:-}
+
+        print_info "Previous configuration loaded successfully"
+    fi
+fi
+
+# ==============================================================================
 # USER INPUT
 # ==============================================================================
 
 print_header "Step 2: Configuration"
 
-echo "What would you like to install?"
-echo "  1) Agent only (for client EC2 instances)"
-echo "  2) Dashboard only (for management server)"
-echo "  3) Both Agent and Dashboard"
-echo ""
-read -p "Enter choice [1-3]: " INSTALL_CHOICE
+if [ "$REUSE_CONFIG" = false ]; then
+    echo "What would you like to install?"
+    echo "  1) Agent only (for client EC2 instances)"
+    echo "  2) Dashboard only (for management server)"
+    echo "  3) Both Agent and Dashboard"
+    echo ""
+    read -p "Enter choice [1-3]: " INSTALL_CHOICE
 
-case $INSTALL_CHOICE in
-    1) INSTALL_AGENT=true; INSTALL_DASHBOARD=false ;;
-    2) INSTALL_AGENT=false; INSTALL_DASHBOARD=true ;;
-    3) INSTALL_AGENT=true; INSTALL_DASHBOARD=true ;;
-    *) print_error "Invalid choice"; exit 1 ;;
-esac
+    case $INSTALL_CHOICE in
+        1) INSTALL_AGENT=true; INSTALL_DASHBOARD=false ;;
+        2) INSTALL_AGENT=false; INSTALL_DASHBOARD=true ;;
+        3) INSTALL_AGENT=true; INSTALL_DASHBOARD=true ;;
+        *) print_error "Invalid choice"; exit 1 ;;
+    esac
+fi
 
-if [ "$INSTALL_AGENT" = true ]; then
+if [ "$INSTALL_AGENT" = true ] && [ "$REUSE_CONFIG" = false ]; then
     echo ""
     read -p "Enter Central Server URL (e.g., http://10.0.1.50:5000): " SERVER_URL
     if [ -z "$SERVER_URL" ]; then
@@ -164,7 +200,7 @@ if [ "$INSTALL_AGENT" = true ]; then
     read -p "Enter Logical Agent ID (optional, press Enter to use instance ID): " LOGICAL_AGENT_ID
 fi
 
-if [ "$INSTALL_DASHBOARD" = true ]; then
+if [ "$INSTALL_DASHBOARD" = true ] && [ "$REUSE_CONFIG" = false ]; then
     echo ""
     # Default to SERVER_URL if agent is also being installed
     DEFAULT_BACKEND=${SERVER_URL:-http://localhost:5000}
@@ -172,6 +208,30 @@ if [ "$INSTALL_DASHBOARD" = true ]; then
     BACKEND_URL=${BACKEND_URL:-$DEFAULT_BACKEND}
     BACKEND_URL=${BACKEND_URL%/}
 fi
+
+# ==============================================================================
+# SAVE INSTANCE MEMORY
+# ==============================================================================
+
+# Save configuration for future reinstalls (survives uninstall)
+sudo mkdir -p "$INSTANCE_MEMORY_DIR"
+sudo tee "$INSTANCE_MEMORY_FILE" > /dev/null << EOF
+# Spot Optimizer Instance Memory
+# This file is preserved during uninstall to remember instance configuration
+# Generated: $(date)
+
+SAVED_INSTALL_AGENT=$INSTALL_AGENT
+SAVED_INSTALL_DASHBOARD=$INSTALL_DASHBOARD
+SAVED_SERVER_URL=$SERVER_URL
+SAVED_CLIENT_TOKEN=$CLIENT_TOKEN
+SAVED_AWS_REGION=$AWS_REGION
+SAVED_LOGICAL_AGENT_ID=$LOGICAL_AGENT_ID
+SAVED_BACKEND_URL=$BACKEND_URL
+SAVED_INSTANCE_ID=$INSTANCE_ID
+EOF
+
+sudo chmod 600 "$INSTANCE_MEMORY_FILE"
+print_info "Configuration saved for future reinstalls"
 
 echo ""
 print_warning "Installation Summary:"

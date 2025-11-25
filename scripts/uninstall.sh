@@ -171,6 +171,9 @@ if [ -d /etc/spot-optimizer ]; then
     log_info "  Removed /etc/spot-optimizer"
 fi
 
+# NOTE: /var/lib/spot-optimizer is PRESERVED for reinstallation memory
+log_info "  Preserved /var/lib/spot-optimizer (instance memory)"
+
 log_success "Configuration files removed"
 
 # ============================================================================
@@ -305,4 +308,6 @@ log_warn "Important notes:"
 echo "  • This instance is no longer reporting to the Spot Optimizer backend"
 echo "  • You may need to remove this instance from the admin dashboard manually"
 echo "  • Any EC2 replicas created by this agent will NOT be automatically terminated"
+echo "  • Instance memory preserved at /var/lib/spot-optimizer for future reinstalls"
+echo "  • To completely remove including memory: sudo rm -rf /var/lib/spot-optimizer"
 echo ""
