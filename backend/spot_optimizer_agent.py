@@ -416,6 +416,44 @@ class ServerAPI:
             'detected_at': datetime.now(timezone.utc).isoformat()
         })
 
+    def get_instances_to_terminate(self, agent_id: str) -> Optional[Dict]:
+        """
+        Get list of instances that should be terminated by the agent.
+
+        Returns instances that are:
+        1. Marked as 'zombie' and past their terminate_wait_seconds
+        2. Marked as 'terminated' in replica_instances but not yet terminated in AWS
+
+        Returns:
+            Dict with 'instances', 'auto_terminate_enabled', 'terminate_wait_seconds'
+            or None on error
+        """
+        return self._make_request('GET', f'/api/agents/{agent_id}/instances-to-terminate')
+
+    def report_instance_termination(self, agent_id: str, instance_id: str,
+                                   success: bool, error: Optional[str] = None,
+                                   terminated_at: Optional[str] = None) -> bool:
+        """
+        Report instance termination result back to backend.
+
+        Args:
+            agent_id: Agent ID
+            instance_id: Instance ID that was terminated
+            success: True if termination succeeded, False if failed
+            error: Error message if termination failed
+            terminated_at: ISO timestamp when instance was terminated
+
+        Returns:
+            True if report was received by backend, False otherwise
+        """
+        result = self._make_request('POST', f'/api/agents/{agent_id}/termination-report', json={
+            'instance_id': instance_id,
+            'success': success,
+            'error': error,
+            'terminated_at': terminated_at
+        })
+        return result is not None
+
     def create_emergency_replica(self, agent_id: str, signal_type: str,
                                   instance_id: str, termination_time: Optional[str] = None) -> Optional[Dict]:
         """
@@ -2204,27 +2242,237 @@ class SpotOptimizerAgent:
             self.shutdown_event.wait(config.REBALANCE_CHECK_INTERVAL)
 
     def _cleanup_worker(self):
-        """Periodic cleanup of old snapshots and AMIs"""
+        """
+        Periodic cleanup worker that:
+        1. Cleans up old snapshots and AMIs
+        2. Terminates instances marked as 'zombie' or 'terminated' in backend database
+
+        This worker polls the backend every 60 seconds for instances that need termination.
+        """
+        logger.info("╔══════════════════════════════════════════════════════════════╗")
+        logger.info("║  Cleanup Worker Started                                     ║")
+        logger.info("║  - AMI/Snapshot cleanup every 1 hour                        ║")
+        logger.info("║  - Instance termination check every 60 seconds              ║")
+        logger.info("╚══════════════════════════════════════════════════════════════╝")
+
         # Initial delay before first cleanup
         self.shutdown_event.wait(60)
 
+        last_full_cleanup = 0
+        cleanup_interval = config.CLEANUP_INTERVAL  # 1 hour for AMI/snapshot cleanup
+        termination_check_interval = 60  # 60 seconds for instance termination
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
-                logger.info("Running cleanup operations...")
-                cleanup_result = self.cleanup_manager.run_full_cleanup()
+                current_time = time.time()
 
-                # Report cleanup to server
-                self.server_api.report_cleanup(self.agent_id, cleanup_result)
+                # Run full cleanup (AMIs/Snapshots) every CLEANUP_INTERVAL
+                if current_time - last_full_cleanup >= cleanup_interval:
+                    logger.info("═" * 70)
+                    logger.info("🧹 Running AMI/Snapshot cleanup operations...")
+                    logger.info("═" * 70)
 
-                snap_deleted = len(cleanup_result['snapshots'].get('deleted', []))
-                ami_deleted = len(cleanup_result['amis'].get('deleted_amis', []))
+                    cleanup_result = self.cleanup_manager.run_full_cleanup()
 
-                logger.info(f"Cleanup completed: {snap_deleted} snapshots, {ami_deleted} AMIs deleted")
+                    # Report cleanup to server
+                    self.server_api.report_cleanup(self.agent_id, cleanup_result)
+
+                    snap_deleted = len(cleanup_result['snapshots'].get('deleted', []))
+                    ami_deleted = len(cleanup_result['amis'].get('deleted_amis', []))
+
+                    logger.info(f"✅ Cleanup completed: {snap_deleted} snapshots, {ami_deleted} AMIs deleted")
+                    last_full_cleanup = current_time
+
+                # Run instance termination check every 60 seconds
+                logger.debug("Checking for instances to terminate...")
+                self._terminate_marked_instances()
 
             except Exception as e:
-                logger.error(f"Cleanup error: {e}")
+                logger.error(f"Cleanup worker error: {e}")
 
-            self.shutdown_event.wait(config.CLEANUP_INTERVAL)
+            # Wait before next check (60 seconds for termination, may trigger full cleanup)
+            self.shutdown_event.wait(termination_check_interval)
+
+    def _terminate_marked_instances(self):
+        """
+        Fetch and terminate instances marked for termination by the backend.
+
+        This method:
+        1. Polls backend for instances marked as 'zombie' or 'terminated'
+        2. Terminates them via AWS EC2 API
+        3. Reports results back to backend
+
+        Backend marks instances for termination when:
+        - Manual replica toggle is turned OFF
+        - Instance becomes 'zombie' after replica promotion
+        - Auto-terminate wait period expires
+        """
+        try:
+            # Get instances to terminate from backend
+            response = self.server_api.get_instances_to_terminate(self.agent_id)
+
+            if not response:
+                logger.debug("No response from backend for instances to terminate")
+                return
+
+            instances_to_terminate = response.get('instances', [])
+            auto_terminate_enabled = response.get('auto_terminate_enabled', False)
+            terminate_wait_seconds = response.get('terminate_wait_seconds', 300)
+
+            if not auto_terminate_enabled:
+                logger.debug("🛡️  Auto-terminate is DISABLED - skipping instance termination")
+                return
+
+            if not instances_to_terminate:
+                logger.debug("No instances to terminate")
+                return
+
+            # Found instances to terminate
+            logger.warning("=" * 70)
+            logger.warning(f"🗑️  INSTANCE TERMINATION: Found {len(instances_to_terminate)} instance(s) to terminate")
+            logger.warning(f"   Auto-terminate: ENABLED")
+            logger.warning(f"   Terminate wait: {terminate_wait_seconds}s")
+            logger.warning("=" * 70)
+
+            # Terminate each instance
+            for inst in instances_to_terminate:
+                instance_id = inst.get('instance_id')
+                instance_type = inst.get('instance_type', 'unknown')
+                az = inst.get('az', 'unknown')
+                reason = inst.get('reason', 'unknown')
+                seconds_info = inst.get('seconds_waiting') or inst.get('seconds_since_marked', 0)
+
+                if not instance_id:
+                    logger.warning("⚠️  Skipping instance with missing instance_id")
+                    continue
+
+                logger.warning("")
+                logger.warning(f"🔧 TERMINATING INSTANCE:")
+                logger.warning(f"   Instance ID: {instance_id}")
+                logger.warning(f"   Instance Type: {instance_type}")
+                logger.warning(f"   AZ: {az}")
+                logger.warning(f"   Reason: {reason}")
+                logger.warning(f"   Wait Time: {seconds_info}s")
+                logger.warning("")
+
+                try:
+                    # Terminate via AWS EC2 API
+                    self._terminate_instance_via_aws(instance_id)
+
+                    # Report success to backend
+                    terminated_at = datetime.now(timezone.utc).isoformat()
+                    self.server_api.report_instance_termination(
+                        self.agent_id, instance_id,
+                        success=True,
+                        terminated_at=terminated_at
+                    )
+
+                    logger.warning(f"✅✅✅ INSTANCE {instance_id} TERMINATED SUCCESSFULLY ✅✅✅")
+                    logger.warning("")
+
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    error_msg = e.response.get('Error', {}).get('Message', str(e))
+
+                    logger.error("")
+                    logger.error(f"✗✗✗ AWS API ERROR during instance termination ✗✗✗")
+                    logger.error(f"✗ Instance: {instance_id}")
+                    logger.error(f"✗ Error Code: {error_code}")
+                    logger.error(f"✗ Error Message: {error_msg}")
+                    logger.error("")
+
+                    # Report failure to backend
+                    self.server_api.report_instance_termination(
+                        self.agent_id, instance_id,
+                        success=False,
+                        error=f"{error_code}: {error_msg}"
+                    )
+
+                except Exception as e:
+                    logger.error("")
+                    logger.error(f"✗✗✗ UNEXPECTED ERROR during instance termination ✗✗✗")
+                    logger.error(f"✗ Instance: {instance_id}")
+                    logger.error(f"✗ Error: {e}")
+                    logger.error("")
+
+                    # Report failure to backend
+                    self.server_api.report_instance_termination(
+                        self.agent_id, instance_id,
+                        success=False,
+                        error=str(e)
+                    )
+
+        except Exception as e:
+            logger.error(f"Error in _terminate_marked_instances: {e}")
+
+    def _terminate_instance_via_aws(self, instance_id: str):
+        """
+        Terminate a single instance via AWS EC2 API.
+
+        Args:
+            instance_id: EC2 instance ID to terminate
+
+        Raises:
+            ClientError: AWS API error (except InvalidInstanceID.NotFound which is handled gracefully)
+            Exception: Other errors during termination
+        """
+        try:
+            logger.info(f"→ Checking if instance {instance_id} exists in AWS...")
+
+            # Check if instance exists first
+            try:
+                describe_response = self.instance_switcher.ec2.describe_instances(InstanceIds=[instance_id])
+
+                if not describe_response['Reservations']:
+                    logger.warning(f"⚠️  Instance {instance_id} not found in AWS (already deleted)")
+                    logger.info(f"→ Instance already terminated - reporting success")
+                    return  # Instance doesn't exist, treat as success
+
+                # Check current state
+                instance_state = describe_response['Reservations'][0]['Instances'][0]['State']['Name']
+                logger.info(f"→ Instance {instance_id} current state: {instance_state}")
+
+                if instance_state in ['terminated', 'terminating']:
+                    logger.info(f"✓ Instance {instance_id} already {instance_state}")
+                    return  # Already terminated, treat as success
+
+            except ClientError as check_error:
+                error_code = check_error.response.get('Error', {}).get('Code', '')
+                if error_code == 'InvalidInstanceID.NotFound':
+                    logger.warning(f"⚠️  Instance {instance_id} not found in AWS (InvalidInstanceID)")
+                    logger.info(f"→ Instance already terminated - reporting success")
+                    return  # Instance doesn't exist, treat as success
+                else:
+                    # Other error, re-raise
+                    raise
+
+            # Terminate the instance
+            logger.info(f"→ Calling AWS EC2 API: terminate_instances({instance_id})...")
+            response = self.instance_switcher.ec2.terminate_instances(InstanceIds=[instance_id])
+
+            # Verify termination was initiated
+            if response.get('TerminatingInstances'):
+                terminating_inst = response['TerminatingInstances'][0]
+                current_state = terminating_inst['CurrentState']['Name']
+                previous_state = terminating_inst['PreviousState']['Name']
+                logger.info(f"✓ Instance {instance_id} state: {previous_state} → {current_state}")
+                logger.info(f"✅ Successfully terminated EC2 instance {instance_id}")
+            else:
+                raise Exception("No terminating instances in AWS response")
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+
+            # Special handling for instance not found
+            if error_code == 'InvalidInstanceID.NotFound':
+                logger.warning(f"⚠️  Instance {instance_id} not found - may already be terminated")
+                # Treat as success since the goal (instance gone) is achieved
+                return
+            elif error_code == 'UnauthorizedOperation':
+                raise Exception(f"IAM permissions insufficient to terminate instance {instance_id}")
+            else:
+                # Re-raise for caller to handle
+                raise
 
     def _check_agent_deleted(self) -> bool:
         """
