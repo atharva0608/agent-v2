@@ -1780,6 +1780,7 @@ class SpotOptimizerAgent:
     def _replica_termination_worker(self):
         """Poll for replicas that need to be terminated and terminate their EC2 instances"""
         terminated_replica_ids = set()  # Track replicas we've already terminated
+        last_logged_count = -1  # Track last count to avoid spam
 
         while self.is_running and not self.shutdown_event.is_set():
             try:
@@ -1796,20 +1797,26 @@ class SpotOptimizerAgent:
                 else:
                     terminated_replicas = []
 
+                # Log when we find replicas to terminate (avoid spam by checking count change)
+                if len(terminated_replicas) > 0 and len(terminated_replicas) != last_logged_count:
+                    logger.info(f"Found {len(terminated_replicas)} replica(s) marked for termination")
+                    last_logged_count = len(terminated_replicas)
+                elif len(terminated_replicas) == 0 and last_logged_count != 0:
+                    logger.debug("No replicas pending termination")
+                    last_logged_count = 0
+
                 for replica in terminated_replicas:
                     replica_id = replica.get('id')
                     instance_id = replica.get('instance_id')
                     is_active = replica.get('is_active', False)
+                    replica_status = replica.get('status', 'unknown')
 
                     if not all([replica_id, instance_id]):
+                        logger.warning(f"Skipping replica with missing data: replica_id={replica_id}, instance_id={instance_id}")
                         continue
 
                     # Skip if we've already terminated this replica in this session
                     if replica_id in terminated_replica_ids:
-                        continue
-
-                    # Skip if replica is not active (already terminated)
-                    if not is_active:
                         continue
 
                     # Skip placeholder instance IDs (not real EC2 instances)
@@ -1818,13 +1825,52 @@ class SpotOptimizerAgent:
                         terminated_replica_ids.add(replica_id)
                         continue
 
+                    # Log detailed info about replica we're about to terminate
+                    logger.warning(f"REPLICA TERMINATION TRIGGERED: replica_id={replica_id}, instance_id={instance_id}, status={replica_status}, is_active={is_active}")
                     logger.info(f"Terminating EC2 instance {instance_id} for replica {replica_id}")
                     terminated_replica_ids.add(replica_id)
 
                     try:
+                        # Check if instance exists before trying to terminate
+                        try:
+                            instance_check = self.instance_switcher.ec2.describe_instances(InstanceIds=[instance_id])
+                            if not instance_check['Reservations']:
+                                logger.warning(f"Instance {instance_id} not found in AWS, marking replica as terminated in database")
+                                # Instance doesn't exist, just update database
+                                self.server_api.update_replica_status(
+                                    self.agent_id,
+                                    replica_id,
+                                    {
+                                        'status': 'terminated',
+                                        'is_active': False,
+                                        'terminated_at': datetime.now(timezone.utc).isoformat()
+                                    }
+                                )
+                                continue
+
+                            # Check current instance state
+                            instance_state = instance_check['Reservations'][0]['Instances'][0]['State']['Name']
+                            if instance_state in ['terminated', 'terminating']:
+                                logger.info(f"Instance {instance_id} already {instance_state}, updating database")
+                                self.server_api.update_replica_status(
+                                    self.agent_id,
+                                    replica_id,
+                                    {
+                                        'status': 'terminated',
+                                        'is_active': False,
+                                        'terminated_at': datetime.now(timezone.utc).isoformat()
+                                    }
+                                )
+                                continue
+
+                        except Exception as check_error:
+                            logger.error(f"Failed to check instance {instance_id} status: {check_error}")
+                            # Continue with termination attempt anyway
+
                         # Terminate the EC2 instance
+                        logger.info(f"Calling EC2 terminate_instances for {instance_id}")
                         self.instance_switcher.ec2.terminate_instances(InstanceIds=[instance_id])
-                        logger.info(f"Successfully terminated EC2 instance {instance_id} for replica {replica_id}")
+                        logger.info(f"✓ Successfully terminated EC2 instance {instance_id} for replica {replica_id}")
 
                         # Update replica status to confirm termination
                         self.server_api.update_replica_status(
@@ -1836,9 +1882,10 @@ class SpotOptimizerAgent:
                                 'terminated_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
+                        logger.info(f"✓ Database updated for replica {replica_id}")
 
                     except Exception as e:
-                        logger.error(f"Failed to terminate EC2 instance {instance_id} for replica {replica_id}: {e}")
+                        logger.error(f"✗ Failed to terminate EC2 instance {instance_id} for replica {replica_id}: {e}")
                         # Don't retry immediately - will try again on next poll
 
             except Exception as e:
