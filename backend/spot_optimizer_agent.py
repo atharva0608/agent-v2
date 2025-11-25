@@ -1435,6 +1435,9 @@ class SpotOptimizerAgent:
         self.cached_instance_type: Optional[str] = None
         self.cached_ondemand_price: Optional[float] = None
 
+        # Replica launch tracking (prevent duplicates)
+        self.launched_replicas: set = set()
+
         # Threads
         self.threads: List[threading.Thread] = []
         self.shutdown_event = threading.Event()
@@ -1675,6 +1678,17 @@ class SpotOptimizerAgent:
 
                 for replica in pending_replicas:
                     replica_id = replica.get('id')
+                    replica_instance_id = replica.get('instance_id')
+
+                    # Skip if already launched in this session
+                    if replica_id in self.launched_replicas:
+                        continue
+
+                    # Skip if replica already has a real EC2 instance ID (not placeholder)
+                    if replica_instance_id and replica_instance_id.startswith('i-'):
+                        logger.debug(f"Replica {replica_id} already has instance {replica_instance_id}, skipping")
+                        self.launched_replicas.add(replica_id)  # Track to avoid checking again
+                        continue
 
                     # Handle both flat and nested pool structures
                     pool_id = replica.get('pool_id')
@@ -1689,6 +1703,9 @@ class SpotOptimizerAgent:
                     if not all([replica_id, pool_id, target_az]):
                         logger.warning(f"Invalid replica data: {replica}")
                         continue
+
+                    # Mark as being launched to prevent duplicates
+                    self.launched_replicas.add(replica_id)
 
                     logger.info(f"Launching EC2 instance for replica {replica_id} in AZ {target_az}")
 
@@ -1763,6 +1780,8 @@ class SpotOptimizerAgent:
 
                     except Exception as e:
                         logger.error(f"Failed to launch replica {replica_id}: {e}")
+                        # Remove from tracking so it can be retried
+                        self.launched_replicas.discard(replica_id)
                         # Update replica status to failed
                         self.server_api.update_replica_status(
                             self.agent_id,
