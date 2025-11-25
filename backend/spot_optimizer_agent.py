@@ -443,6 +443,10 @@ class ServerAPI:
         """Get replica configuration"""
         return self._make_request('GET', f'/api/agents/{agent_id}/replica-config')
 
+    def get_replica_details(self, agent_id: str, replica_id: str) -> Optional[Dict]:
+        """Get single replica details"""
+        return self._make_request('GET', f'/api/agents/{agent_id}/replicas/{replica_id}')
+
     def create_replica(self, agent_id: str, replica_data: Dict) -> Optional[Dict]:
         """Create manual replica"""
         return self._make_request('POST', f'/api/agents/{agent_id}/replicas', json=replica_data)
@@ -1632,6 +1636,53 @@ class SpotOptimizerAgent:
                                     success = True
                                     message = f"Replica created: {replica_id}"
                                     logger.info(message)
+
+                            self.server_api.mark_command_executed(
+                                self.agent_id, command_id, success, message
+                            )
+
+                        elif command_type == 'terminate_replica':
+                            # Terminate replica command
+                            replica_id = command.get('replica_id')
+                            logger.info(f"Executing replica termination command {command_id} for replica {replica_id}")
+
+                            success = False
+                            message = "Replica termination failed"
+
+                            if replica_id:
+                                # Get replica details from backend first
+                                replica = self.server_api.get_replica_details(self.agent_id, replica_id)
+
+                                if replica and replica.get('instance_id'):
+                                    instance_id = replica['instance_id']
+
+                                    # Only terminate if instance ID is real (starts with i-)
+                                    if instance_id.startswith('i-'):
+                                        try:
+                                            logger.info(f"Terminating replica instance {instance_id}")
+                                            self.instance_switcher.ec2.terminate_instances(InstanceIds=[instance_id])
+
+                                            # Update replica status to terminated
+                                            self.server_api.update_replica_status(
+                                                self.agent_id,
+                                                replica_id,
+                                                {'status': 'terminated'}
+                                            )
+
+                                            success = True
+                                            message = f"Replica {replica_id} (instance {instance_id}) terminated"
+                                            logger.info(message)
+                                        except Exception as e:
+                                            message = f"Failed to terminate replica: {str(e)}"
+                                            logger.error(message)
+                                    else:
+                                        message = f"Replica {replica_id} has no valid instance ID"
+                                        logger.warning(message)
+                                        success = True  # Mark as success since there's nothing to terminate
+                                else:
+                                    message = f"Replica {replica_id} not found or has no instance"
+                                    logger.warning(message)
+                                    success = True  # Mark as success since replica doesn't exist
 
                             self.server_api.mark_command_executed(
                                 self.agent_id, command_id, success, message
