@@ -321,6 +321,12 @@ def get_instance(instance_id):
     data = proxy_request(f'/api/instances/{instance_id}')
     return jsonify(data)
 
+@app.route('/api/client/instances/<instance_id>/available-options', methods=['GET'])
+def get_instance_available_options(instance_id):
+    """Get available spot/on-demand options for instance"""
+    data = proxy_request(f'/api/client/instances/{instance_id}/available-options')
+    return jsonify(data)
+
 # ============================================================================
 # HEALTH & INFO
 # ============================================================================
