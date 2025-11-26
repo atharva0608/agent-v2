@@ -2110,16 +2110,62 @@ class SpotOptimizerAgent:
 
     def _config_refresh_worker(self):
         """Periodically refresh configuration"""
+        # Track previous config states
+        prev_auto_switch = None
+        prev_auto_terminate = None
+        prev_manual_replica = None
+
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 agent_config = self.server_api.get_agent_config(self.agent_id)
 
                 if agent_config:
                     new_enabled = agent_config.get('enabled', True)
+                    new_auto_switch = agent_config.get('auto_switch_enabled', False)
+                    new_auto_terminate = agent_config.get('auto_terminate_enabled', False)
+                    new_manual_replica = agent_config.get('manual_replica_enabled', False)
 
+                    # Log enabled state changes
                     if new_enabled != self.is_enabled:
-                        logger.info(f"Agent enabled state changed: {self.is_enabled} -> {new_enabled}")
+                        logger.warning("═" * 70)
+                        logger.warning(f"⚙️  AGENT ENABLED STATE CHANGED: {self.is_enabled} → {new_enabled}")
+                        logger.warning("═" * 70)
                         self.is_enabled = new_enabled
+
+                    # Log auto_switch_enabled changes
+                    if prev_auto_switch is not None and new_auto_switch != prev_auto_switch:
+                        logger.warning("═" * 70)
+                        logger.warning(f"🔄 AUTO-SWITCH CONFIG CHANGED: {prev_auto_switch} → {new_auto_switch}")
+                        logger.warning("═" * 70)
+
+                    # Log auto_terminate_enabled changes
+                    if prev_auto_terminate is not None and new_auto_terminate != prev_auto_terminate:
+                        logger.warning("═" * 70)
+                        logger.warning(f"🗑️  AUTO-TERMINATE CONFIG CHANGED: {prev_auto_terminate} → {new_auto_terminate}")
+                        if new_auto_terminate:
+                            logger.warning("   Zombie instances will now be automatically terminated")
+                        else:
+                            logger.warning("   Zombie instances will NOT be automatically terminated")
+                        logger.warning("═" * 70)
+
+                    # Log manual_replica_enabled changes
+                    if prev_manual_replica is not None and new_manual_replica != prev_manual_replica:
+                        logger.warning("═" * 70)
+                        logger.warning(f"👥 MANUAL REPLICA MODE CHANGED: {prev_manual_replica} → {new_manual_replica}")
+                        if new_manual_replica:
+                            logger.warning("   Manual replica mode ENABLED - hot standby will be maintained")
+                            logger.warning("   Auto-switching is DISABLED")
+                        else:
+                            logger.warning("   Manual replica mode DISABLED - replica instances will be terminated")
+                            logger.warning("   Checking for instances to terminate in next cleanup cycle...")
+                        logger.warning("═" * 70)
+
+                    # Update tracked values
+                    prev_auto_switch = new_auto_switch
+                    prev_auto_terminate = new_auto_terminate
+                    prev_manual_replica = new_manual_replica
+
+                    logger.debug(f"Config refreshed: enabled={self.is_enabled}, auto_switch={new_auto_switch}, auto_terminate={new_auto_terminate}, manual_replica={new_manual_replica}")
 
             except Exception as e:
                 logger.error(f"Config refresh error: {e}")
@@ -2354,7 +2400,7 @@ class SpotOptimizerAgent:
                     last_full_cleanup = current_time
 
                 # Run instance termination check every 60 seconds
-                logger.debug("Checking for instances to terminate...")
+                logger.info("🔍 Checking for instances to terminate...")
                 self._terminate_marked_instances()
 
             except Exception as e:
@@ -2382,7 +2428,7 @@ class SpotOptimizerAgent:
             response = self.server_api.get_instances_to_terminate(self.agent_id)
 
             if not response:
-                logger.debug("No response from backend for instances to terminate")
+                logger.warning("⚠️  No response from backend for instances to terminate")
                 return
 
             instances_to_terminate = response.get('instances', [])
@@ -2390,11 +2436,11 @@ class SpotOptimizerAgent:
             terminate_wait_seconds = response.get('terminate_wait_seconds', 300)
 
             if not auto_terminate_enabled:
-                logger.debug("🛡️  Auto-terminate is DISABLED - skipping instance termination")
+                logger.info("🛡️  Auto-terminate is DISABLED - skipping instance termination")
                 return
 
             if not instances_to_terminate:
-                logger.debug("No instances to terminate")
+                logger.info(f"✅ No instances to terminate (checked at {datetime.now(timezone.utc).strftime('%H:%M:%S')})")
                 return
 
             # Found instances to terminate
