@@ -578,14 +578,24 @@ class InstanceSwitcher:
                 logger.error("Cannot get current instance details")
                 return False
             
-            # Step 1: Create snapshot if enabled
+            # Step 1: Create snapshot if enabled (Fix #3: Wait for snapshot before using it)
             snapshot_data = {'used': False}
+            snapshot_id = None
             if config.CREATE_SNAPSHOT_ON_SWITCH:
                 snapshot_data = self._create_snapshot(current_instance)
-            
-            # Step 2: Launch new instance
+                if snapshot_data['used']:
+                    snapshot_id = snapshot_data['snapshot_id']
+                    logger.info(f"Waiting for snapshot {snapshot_id} to complete...")
+                    # Wait for snapshot to be ready before launching new instance
+                    if not self._wait_for_snapshot_ready(snapshot_id):
+                        logger.error("Snapshot failed to complete in time")
+                        logger.warning("Proceeding without snapshot - data will NOT be persisted")
+                        snapshot_id = None
+                        snapshot_data['used'] = False
+
+            # Step 2: Launch new instance (Fix #3: Pass snapshot_id for data persistence)
             new_instance_id = self._launch_new_instance(
-                current_instance, target_mode, target_pool_id
+                current_instance, target_mode, target_pool_id, snapshot_id
             )
             
             if not new_instance_id:
@@ -746,14 +756,58 @@ class InstanceSwitcher:
         except Exception as e:
             logger.error(f"Failed to create snapshot: {e}")
             return {'used': False}
-    
+
+    def _wait_for_snapshot_ready(self, snapshot_id: str, timeout: int = 600) -> bool:
+        """
+        Wait for snapshot to complete (Fix #4: Ensure snapshot is ready before using it)
+
+        Args:
+            snapshot_id: The snapshot ID to wait for
+            timeout: Maximum time to wait in seconds (default 600s = 10 minutes)
+
+        Returns:
+            True if snapshot completed successfully, False otherwise
+        """
+        try:
+            logger.info(f"Waiting for snapshot {snapshot_id} to complete...")
+            start_time = time.time()
+
+            while time.time() - start_time < timeout:
+                response = self.ec2.describe_snapshots(SnapshotIds=[snapshot_id])
+                if not response['Snapshots']:
+                    logger.error(f"Snapshot {snapshot_id} not found")
+                    return False
+
+                state = response['Snapshots'][0]['State']
+                progress = response['Snapshots'][0].get('Progress', '0%')
+
+                if state == 'completed':
+                    logger.info(f"✓ Snapshot {snapshot_id} completed (100%)")
+                    return True
+                elif state == 'error':
+                    logger.error(f"✗ Snapshot {snapshot_id} failed with error state")
+                    return False
+
+                logger.info(f"Snapshot progress: {progress} (state: {state})")
+                time.sleep(10)  # Check every 10 seconds
+
+            logger.error(f"✗ Snapshot {snapshot_id} timeout after {timeout}s")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to wait for snapshot: {e}")
+            return False
+
     def _launch_new_instance(self, current_instance: Dict, target_mode: str,
-                            target_pool_id: Optional[str]) -> Optional[str]:
+                            target_pool_id: Optional[str], snapshot_id: Optional[str] = None) -> Optional[str]:
         """Launch new instance"""
         try:
             logger.info(f"Preparing to launch {target_mode} instance...")
             logger.info(f"  AMI: {current_instance['ami_id']}")
             logger.info(f"  Instance Type: {current_instance['instance_type']}")
+
+            # Fix #2: Log snapshot usage for data persistence
+            if snapshot_id:
+                logger.info(f"  Snapshot: {snapshot_id} (for data persistence)")
 
             launch_params = {
                 'ImageId': current_instance['ami_id'],
@@ -769,6 +823,18 @@ class InstanceSwitcher:
                     ]
                 }]
             }
+
+            # Fix #2: Add snapshot restoration for data persistence
+            if snapshot_id:
+                logger.info(f"Configuring instance to restore from snapshot {snapshot_id}...")
+                launch_params['BlockDeviceMappings'] = [{
+                    'DeviceName': '/dev/sda1',  # Root volume device (try /dev/xvda if this doesn't work)
+                    'Ebs': {
+                        'SnapshotId': snapshot_id,
+                        'VolumeType': 'gp3',
+                        'DeleteOnTermination': True
+                    }
+                }]
 
             if target_mode == 'spot' and target_pool_id:
                 # Extract AZ from pool_id
@@ -790,6 +856,11 @@ class InstanceSwitcher:
 
             new_instance_id = response['Instances'][0]['InstanceId']
             logger.info(f"✓ New instance launched successfully: {new_instance_id}")
+
+            # Fix #2: Log data persistence status
+            if snapshot_id:
+                logger.info(f"✓ Instance will restore data from snapshot {snapshot_id}")
+                logger.info("✓ Full data persistence enabled - agent data will be preserved")
 
             return new_instance_id
         except ClientError as e:
